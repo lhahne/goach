@@ -74,6 +74,38 @@ npm run deploy
 add your habit MCP again (the deployed agent has its own Durable Object
 state), and you're set.
 
+## Auth (Cloudflare Access)
+
+The deployed worker has no built-in user auth — anyone with the URL can
+chat with your coach. Put **Cloudflare Access** in front of it:
+
+1. **Dashboard:** Zero Trust → Access → Applications → Add an
+   application → Self-hosted. Set the application domain to your
+   worker hostname (`goach.<account>.workers.dev` or your custom
+   domain). Add a policy (e.g. "Emails ending in `@yourdomain.com`").
+   Copy the **Application Audience (AUD) Tag** from the application's
+   overview page, and your team domain (e.g.
+   `myteam.cloudflareaccess.com`).
+2. **Worker config:** in `wrangler.jsonc`, set:
+   ```jsonc
+   "vars": {
+     "ACCESS_TEAM_DOMAIN": "myteam.cloudflareaccess.com",
+     "ACCESS_AUD": "<paste-the-aud-tag-here>"
+   }
+   ```
+   Or set them as secrets so they're not in git:
+   ```bash
+   wrangler secret put ACCESS_TEAM_DOMAIN
+   wrangler secret put ACCESS_AUD
+   ```
+3. **Redeploy:** `npm run deploy`.
+
+The worker (`src/auth.ts`) verifies the `Cf-Access-Jwt-Assertion` header
+on every request against your team's JWKS, and rejects requests without
+a valid JWT with `401 Unauthorized`. When either var is empty (the
+default), validation is skipped — that's what makes `npm run dev`
+work without an Access app configured.
+
 ## How it works
 
 `src/server.ts` defines `ChatAgent extends AIChatAgent`. On each user

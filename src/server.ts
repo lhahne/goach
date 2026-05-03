@@ -10,6 +10,7 @@ import {
 } from "ai";
 import { buildCoachTools } from "./tools";
 import { inlineDataUrls } from "./utils";
+import { AccessAuthError, readAccessConfig, verifyAccessJwt } from "./auth";
 
 export class ChatAgent extends AIChatAgent<Env> {
   maxPersistedMessages = 100;
@@ -109,6 +110,22 @@ If the user asks to be reminded of something later, use the scheduleTask tool.`,
 
 export default {
   async fetch(request: Request, env: Env) {
+    // Cloudflare Access gate. When ACCESS_TEAM_DOMAIN + ACCESS_AUD are
+    // set, every request must carry a valid Access JWT (Access injects
+    // it into the Cf-Access-Jwt-Assertion header, also accept the
+    // CF_Authorization cookie). When unset, validation is skipped so
+    // local `npm run dev` works without an Access app configured.
+    const access = readAccessConfig(env);
+    if (access) {
+      try {
+        await verifyAccessJwt(request, access);
+      } catch (err) {
+        if (err instanceof AccessAuthError) {
+          return new Response("Unauthorized", { status: 401 });
+        }
+        throw err;
+      }
+    }
     return (
       (await routeAgentRequest(request, env)) ||
       new Response("Not found", { status: 404 })

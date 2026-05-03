@@ -5,6 +5,15 @@
   "compatibility_date": "2026-03-02",
   "compatibility_flags": ["nodejs_compat"],
   "ai": { "binding": "AI", "remote": true },
+  // Cloudflare Access. Leave empty for local dev (auth is skipped).
+  // For production: set both. Either edit this file, or override via
+  //   wrangler secret put ACCESS_TEAM_DOMAIN
+  //   wrangler secret put ACCESS_AUD
+  // Secrets take precedence over vars at runtime.
+  "vars": {
+    "ACCESS_TEAM_DOMAIN": "",
+    "ACCESS_AUD": ""
+  },
   "assets": {
     "directory": "./public",
     "not_found_handling": "single-page-application",
