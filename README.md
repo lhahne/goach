@@ -75,6 +75,18 @@ npm run deploy
 add your habit MCP again (the deployed agent has its own Durable Object
 state), and you're set.
 
+## Reminders survive disconnects
+
+When a `scheduleTask` fires, the agent persists the notification to its
+Durable Object SQLite (`pending_notifications` table) **before** broadcasting
+to live WebSocket clients. On reconnect, `onConnect` replays any pending
+entries to the new connection and deletes them. So a reminder scheduled while
+the user is offline will be delivered the next time they open the app.
+
+A 30-day TTL prunes the queue on connect to keep it bounded. With multiple
+devices/tabs, only the first one to reconnect after a fire sees the missed
+notifications — adequate for a single-user coach.
+
 ## Auth (Cloudflare Access)
 
 The deployed worker has no built-in user auth — anyone with the URL can

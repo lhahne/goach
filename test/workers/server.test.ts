@@ -1,5 +1,6 @@
 import { env, runInDurableObject, SELF } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
+import type { Connection, ConnectionContext, Schedule } from "agents";
 import type { ChatAgent } from "../../src/server";
 
 // Smoke tests: verify the worker boots in workerd, the bundled module graph
@@ -32,6 +33,120 @@ describe("ChatAgent durable object", () => {
       // require a live MCP server, which is out of scope for a smoke test.
       expect(typeof agent.addServer).toBe("function");
       expect(typeof agent.removeServer).toBe("function");
+    });
+  });
+});
+
+function fakeSchedule(id: string): Schedule<string> {
+  return { id } as unknown as Schedule<string>;
+}
+
+function fakeConnection(sent: string[]): Connection {
+  return {
+    send(msg: string | ArrayBuffer | ArrayBufferView) {
+      sent.push(
+        typeof msg === "string" ? msg : new TextDecoder().decode(msg as ArrayBuffer)
+      );
+    }
+  } as unknown as Connection;
+}
+
+const fakeCtx = {
+  request: new Request("https://goach.test/agents/chat-agent/x")
+} as ConnectionContext;
+
+// super.onConnect sends initial agent-state frames; we only care about
+// the scheduled-task frames our drain replays.
+function scheduledTaskFrames(sent: string[]): Array<{ description: string }> {
+  return sent
+    .map((s) => {
+      try {
+        return JSON.parse(s) as { type?: string; description?: string };
+      } catch {
+        return null;
+      }
+    })
+    .filter(
+      (m): m is { type: string; description: string } =>
+        m !== null && m.type === "scheduled-task"
+    );
+}
+
+describe("durable scheduled-task notifications", () => {
+  it("persists the payload when executeTask fires", async () => {
+    const id = env.ChatAgent.idFromName("notif-persist");
+    const stub = env.ChatAgent.get(id);
+    await runInDurableObject<ChatAgent, void>(stub, async (agent) => {
+      await agent.executeTask("drink water", fakeSchedule("task-1"));
+
+      const rows = agent.sql<{ payload: string; created_at: number }>`
+        SELECT payload, created_at FROM pending_notifications ORDER BY id ASC
+      `;
+      expect(rows).toHaveLength(1);
+      const parsed = JSON.parse(rows[0].payload) as Record<string, unknown>;
+      expect(parsed).toMatchObject({
+        type: "scheduled-task",
+        description: "drink water"
+      });
+      expect(typeof parsed.timestamp).toBe("string");
+      expect(rows[0].created_at).toBeGreaterThan(0);
+    });
+  });
+
+  it("drains the queue to the connecting client and deletes the rows", async () => {
+    const id = env.ChatAgent.idFromName("notif-drain");
+    const stub = env.ChatAgent.get(id);
+    await runInDurableObject<ChatAgent, void>(stub, async (agent) => {
+      await agent.executeTask("a", fakeSchedule("1"));
+      await agent.executeTask("b", fakeSchedule("2"));
+
+      const sent: string[] = [];
+      await agent.onConnect(fakeConnection(sent), fakeCtx);
+
+      const replayed = scheduledTaskFrames(sent);
+      expect(replayed.map((f) => f.description)).toEqual(["a", "b"]);
+
+      const remaining = agent.sql<{ id: number }>`
+        SELECT id FROM pending_notifications
+      `;
+      expect(remaining).toHaveLength(0);
+    });
+  });
+
+  it("replays nothing when the queue is empty", async () => {
+    const id = env.ChatAgent.idFromName("notif-empty");
+    const stub = env.ChatAgent.get(id);
+    await runInDurableObject<ChatAgent, void>(stub, async (agent) => {
+      const sent: string[] = [];
+      await agent.onConnect(fakeConnection(sent), fakeCtx);
+      expect(scheduledTaskFrames(sent)).toHaveLength(0);
+    });
+  });
+
+  it("prunes notifications older than the 30-day TTL on connect", async () => {
+    const id = env.ChatAgent.idFromName("notif-ttl");
+    const stub = env.ChatAgent.get(id);
+    await runInDurableObject<ChatAgent, void>(stub, async (agent) => {
+      const ancient = Date.now() - 40 * 24 * 60 * 60 * 1000; // 40 days ago
+      const fresh = Date.now() - 1000;
+      agent.sql`
+        INSERT INTO pending_notifications (payload, created_at)
+        VALUES (${'{"type":"scheduled-task","description":"old"}'}, ${ancient})
+      `;
+      agent.sql`
+        INSERT INTO pending_notifications (payload, created_at)
+        VALUES (${'{"type":"scheduled-task","description":"new"}'}, ${fresh})
+      `;
+
+      const sent: string[] = [];
+      await agent.onConnect(fakeConnection(sent), fakeCtx);
+
+      const replayed = scheduledTaskFrames(sent);
+      expect(replayed.map((f) => f.description)).toEqual(["new"]);
+      const remaining = agent.sql<{ id: number }>`
+        SELECT id FROM pending_notifications
+      `;
+      expect(remaining).toHaveLength(0);
     });
   });
 });
