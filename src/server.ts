@@ -10,7 +10,12 @@ import {
 } from "ai";
 import { buildCoachTools } from "./tools";
 import { inlineDataUrls } from "./utils";
-import { AccessAuthError, readAccessConfig, verifyAccessJwt } from "./auth";
+import {
+  AccessAuthError,
+  AccessConfigError,
+  readAccessConfig,
+  verifyAccessJwt
+} from "./auth";
 
 export class ChatAgent extends AIChatAgent<Env> {
   maxPersistedMessages = 100;
@@ -91,8 +96,10 @@ If the user asks to be reminded of something later, use the scheduleTask tool.`,
     return result.toUIMessageStreamResponse();
   }
 
-  async executeTask(description: string, _task: Schedule<string>) {
-    console.log(`Executing scheduled task: ${description}`);
+  async executeTask(description: string, task: Schedule<string>) {
+    // Don't log `description` — it's user-supplied and may include
+    // health/personal data (e.g. "weigh in", "log medication time").
+    console.log(`Executing scheduled task ${task.id}`);
 
     // Notify connected clients via a broadcast event.
     // We use broadcast() instead of saveMessages() to avoid injecting
@@ -111,11 +118,22 @@ If the user asks to be reminded of something later, use the scheduleTask tool.`,
 export default {
   async fetch(request: Request, env: Env) {
     // Cloudflare Access gate. When ACCESS_TEAM_DOMAIN + ACCESS_AUD are
-    // set, every request must carry a valid Access JWT (Access injects
-    // it into the Cf-Access-Jwt-Assertion header, also accept the
-    // CF_Authorization cookie). When unset, validation is skipped so
-    // local `npm run dev` works without an Access app configured.
-    const access = readAccessConfig(env);
+    // both set, every request must carry a valid Access JWT (Access
+    // injects it into the Cf-Access-Jwt-Assertion header, also accept
+    // the CF_Authorization cookie). When both are unset, validation is
+    // skipped so local `npm run dev` works without an Access app. When
+    // exactly one is set, readAccessConfig throws so we fail closed
+    // (503) instead of silently leaving the worker unauthenticated.
+    let access: ReturnType<typeof readAccessConfig>;
+    try {
+      access = readAccessConfig(env);
+    } catch (err) {
+      if (err instanceof AccessConfigError) {
+        console.error("Access misconfigured:", err.message);
+        return new Response("Service Unavailable", { status: 503 });
+      }
+      throw err;
+    }
     if (access) {
       try {
         await verifyAccessJwt(request, access);

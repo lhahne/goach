@@ -2,6 +2,7 @@ import { beforeAll, describe, expect, it } from "vitest";
 import { exportJWK, generateKeyPair, SignJWT, type JWTVerifyGetKey } from "jose";
 import {
   AccessAuthError,
+  AccessConfigError,
   readAccessConfig,
   verifyAccessJwt,
   type AccessConfig
@@ -54,24 +55,41 @@ describe("readAccessConfig", () => {
     ).toEqual({ teamDomain: TEAM_DOMAIN, aud: AUD });
   });
 
-  it("returns null when ACCESS_TEAM_DOMAIN is missing", () => {
-    expect(readAccessConfig({ ACCESS_AUD: AUD })).toBeNull();
+  it("returns null when both vars are unset", () => {
+    expect(readAccessConfig({})).toBeNull();
   });
 
-  it("returns null when ACCESS_AUD is missing", () => {
-    expect(readAccessConfig({ ACCESS_TEAM_DOMAIN: TEAM_DOMAIN })).toBeNull();
-  });
-
-  it("returns null when either var is empty/whitespace", () => {
+  it("returns null when both vars are empty strings", () => {
     expect(
-      readAccessConfig({ ACCESS_TEAM_DOMAIN: "  ", ACCESS_AUD: AUD })
-    ).toBeNull();
-    expect(
-      readAccessConfig({ ACCESS_TEAM_DOMAIN: TEAM_DOMAIN, ACCESS_AUD: "" })
+      readAccessConfig({ ACCESS_TEAM_DOMAIN: "", ACCESS_AUD: "" })
     ).toBeNull();
   });
 
-  it("trims whitespace around values", () => {
+  it("returns null when both vars are whitespace", () => {
+    expect(
+      readAccessConfig({ ACCESS_TEAM_DOMAIN: "  ", ACCESS_AUD: "\t" })
+    ).toBeNull();
+  });
+
+  it("throws AccessConfigError when only ACCESS_TEAM_DOMAIN is set (fails closed)", () => {
+    expect(() => readAccessConfig({ ACCESS_TEAM_DOMAIN: TEAM_DOMAIN })).toThrow(
+      AccessConfigError
+    );
+  });
+
+  it("throws AccessConfigError when only ACCESS_AUD is set (fails closed)", () => {
+    expect(() => readAccessConfig({ ACCESS_AUD: AUD })).toThrow(
+      AccessConfigError
+    );
+  });
+
+  it("throws when one var is set and the other is whitespace", () => {
+    expect(() =>
+      readAccessConfig({ ACCESS_TEAM_DOMAIN: TEAM_DOMAIN, ACCESS_AUD: "  " })
+    ).toThrow(AccessConfigError);
+  });
+
+  it("trims whitespace around values when both are set", () => {
     expect(
       readAccessConfig({
         ACCESS_TEAM_DOMAIN: ` ${TEAM_DOMAIN} `,

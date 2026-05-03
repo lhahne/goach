@@ -416,10 +416,15 @@ function Chat() {
     > = [];
     if (text) parts.push({ type: "text", text });
 
-    for (const att of attachments) {
-      const dataUri = await fileToDataUri(att.file);
-      parts.push({ type: "file", mediaType: att.mediaType, url: dataUri });
-    }
+    // Read attachments in parallel — file reads are independent and
+    // sequential awaits would make the send latency the sum of all
+    // file sizes.
+    const dataUris = await Promise.all(
+      attachments.map((att) => fileToDataUri(att.file))
+    );
+    attachments.forEach((att, i) =>
+      parts.push({ type: "file", mediaType: att.mediaType, url: dataUris[i] })
+    );
 
     for (const att of attachments) URL.revokeObjectURL(att.preview);
     setAttachments([]);
@@ -601,10 +606,13 @@ function Chat() {
                                     size="sm"
                                     icon={<SignInIcon size={12} />}
                                     onClick={() =>
+                                      // noopener/noreferrer: auth_url comes
+                                      // from the connected MCP server, so
+                                      // don't expose window.opener to it.
                                       window.open(
                                         server.auth_url as string,
                                         "oauth",
-                                        "width=600,height=800"
+                                        "width=600,height=800,noopener,noreferrer"
                                       )
                                     }
                                   >

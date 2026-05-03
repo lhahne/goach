@@ -28,18 +28,32 @@ export class AccessAuthError extends Error {
   }
 }
 
+export class AccessConfigError extends Error {}
+
 /**
- * Read Access config from the worker env. Returns null if either var
- * is missing/empty — used as a local-dev escape hatch so `npm run dev`
- * works without an Access app configured.
+ * Read Access config from the worker env.
+ *
+ * Three states:
+ *  - both vars empty/unset → returns null (intentional "no auth", e.g.
+ *    `npm run dev` with no Access app configured)
+ *  - both vars set → returns the config; auth is enforced
+ *  - exactly one var set → throws AccessConfigError so the worker fails
+ *    closed instead of silently skipping auth (avoids the footgun of
+ *    deploying with one secret missing and getting an unauthenticated
+ *    public worker)
  */
 export function readAccessConfig(env: {
   ACCESS_TEAM_DOMAIN?: string;
   ACCESS_AUD?: string;
 }): AccessConfig | null {
-  const teamDomain = env.ACCESS_TEAM_DOMAIN?.trim();
-  const aud = env.ACCESS_AUD?.trim();
-  if (!teamDomain || !aud) return null;
+  const teamDomain = env.ACCESS_TEAM_DOMAIN?.trim() ?? "";
+  const aud = env.ACCESS_AUD?.trim() ?? "";
+  if (!teamDomain && !aud) return null;
+  if (!teamDomain || !aud) {
+    throw new AccessConfigError(
+      "Cloudflare Access is partially configured: set both ACCESS_TEAM_DOMAIN and ACCESS_AUD, or unset both."
+    );
+  }
   return { teamDomain, aud };
 }
 

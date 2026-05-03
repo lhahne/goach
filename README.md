@@ -30,11 +30,12 @@ Object locally.
 
 ## Connect your habit MCP
 
-1. Click **Add MCP server** in the header.
-2. Give it a name (e.g. `habits`) and paste the public URL of your habit MCP
-   server.
-3. If the server uses OAuth, complete the popup. The agent stores the auth
-   in its Durable Object so you only do this once.
+1. Click **MCP** in the header to open the server panel.
+2. Give the server a name (e.g. `habits`) and paste the public URL of your
+   habit MCP server, then add it.
+3. If the server uses OAuth, click **Auth** on its row to complete the
+   popup. The agent stores the auth in its Durable Object so you only do
+   this once.
 
 Now ask things like:
 
@@ -102,9 +103,11 @@ chat with your coach. Put **Cloudflare Access** in front of it:
 
 The worker (`src/auth.ts`) verifies the `Cf-Access-Jwt-Assertion` header
 on every request against your team's JWKS, and rejects requests without
-a valid JWT with `401 Unauthorized`. When either var is empty (the
-default), validation is skipped — that's what makes `npm run dev`
-work without an Access app configured.
+a valid JWT with `401 Unauthorized`. When **both** vars are empty (the
+default) validation is skipped — that's what makes `npm run dev` work
+without an Access app configured. When **exactly one** var is set the
+worker fails closed with `503 Service Unavailable` to avoid the footgun
+of accidentally deploying with auth half-configured.
 
 ## How it works
 
