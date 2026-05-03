@@ -46,6 +46,24 @@ Now ask things like:
 The agent will call `list_habits`, `list_days`, `get_day`, `upsert_check_in`,
 etc. on your habit MCP and reason over the results.
 
+## Test
+
+```bash
+npm test                # full suite (unit + workers)
+npm run test:unit       # node-only unit tests for src/utils.ts and src/tools.ts
+npm run test:workers    # workerd integration smoke test (Durable Object boots, fetch routes)
+npm run test:coverage   # v8 coverage report for the unit project
+npm run test:watch      # vitest in watch mode
+```
+
+The unit project covers pure logic (date helpers, tool execute functions) in
+node. The workers project boots the worker in Miniflare via
+`@cloudflare/vitest-pool-workers` and verifies the `ChatAgent` Durable
+Object constructs cleanly and the fetch handler routes correctly. Coverage
+on `src/utils.ts` and `src/tools.ts` is 100% lines / 100% functions; the
+React UI and `src/server.ts` glue are covered by the workers smoke test
+and by `vite build` rather than by unit tests.
+
 ## Deploy
 
 ```bash

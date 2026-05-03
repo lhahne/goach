@@ -20,7 +20,12 @@
     "types": "wrangler types env.d.ts --include-runtime false",
     "format": "oxfmt --write .",
     "lint": "oxlint src/",
-    "check": "oxfmt --check . && oxlint src/ && tsc"
+    "check": "oxfmt --check . && oxlint src/ && tsc",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:unit": "vitest run --project unit",
+    "test:workers": "vitest run --project workers",
+    "test:coverage": "vitest run --coverage"
   },
   "dependencies": {
     "@cloudflare/ai-chat": "^0.6.2",
@@ -38,6 +43,7 @@
   "devDependencies": {
     "@babel/plugin-proposal-decorators": "^7.29.0",
     "@cloudflare/vite-plugin": "1.35.0",
+    "@cloudflare/vitest-pool-workers": "^0.15.2",
     "@cloudflare/workers-types": "^4.20260501.1",
     "@rolldown/plugin-babel": "^0.2.3",
     "@tailwindcss/vite": "^4.2.4",
@@ -45,11 +51,13 @@
     "@types/react": "^19.2.14",
     "@types/react-dom": "^19.2.3",
     "@vitejs/plugin-react": "^6.0.1",
+    "@vitest/coverage-v8": "^4.1.5",
     "oxfmt": "^0.47.0",
     "oxlint": "^1.62.0",
     "tailwindcss": "^4.2.4",
     "typescript": "^6.0.3",
     "vite": "^8.0.10",
+    "vitest": "^4.1.5",
     "wrangler": "4.87.0"
   }
 }

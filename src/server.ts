@@ -1,49 +1,15 @@
 import { createWorkersAI } from "workers-ai-provider";
 import { callable, routeAgentRequest, type Schedule } from "agents";
-import { getSchedulePrompt, scheduleSchema } from "agents/schedule";
+import { getSchedulePrompt } from "agents/schedule";
 import { AIChatAgent, type OnChatMessageOptions } from "@cloudflare/ai-chat";
 import {
   convertToModelMessages,
   pruneMessages,
   stepCountIs,
-  streamText,
-  tool,
-  type ModelMessage
+  streamText
 } from "ai";
-import { z } from "zod";
-
-/**
- * The AI SDK's downloadAssets step runs `new URL(data)` on every file
- * part's string data. Data URIs parse as valid URLs, so it tries to
- * HTTP-fetch them and fails. Decode to Uint8Array so the SDK treats
- * them as inline data instead.
- */
-function isoDateInTimezone(date: Date, timeZone: string): string {
-  const parts = new Intl.DateTimeFormat("en-CA", {
-    timeZone,
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit"
-  }).formatToParts(date);
-  const lookup = Object.fromEntries(parts.map((p) => [p.type, p.value]));
-  return `${lookup.year}-${lookup.month}-${lookup.day}`;
-}
-
-function inlineDataUrls(messages: ModelMessage[]): ModelMessage[] {
-  return messages.map((msg) => {
-    if (msg.role !== "user" || typeof msg.content === "string") return msg;
-    return {
-      ...msg,
-      content: msg.content.map((part) => {
-        if (part.type !== "file" || typeof part.data !== "string") return part;
-        const match = part.data.match(/^data:([^;]+);base64,(.+)$/);
-        if (!match) return part;
-        const bytes = Uint8Array.from(atob(match[2]), (c) => c.charCodeAt(0));
-        return { ...part, data: bytes, mediaType: match[1] };
-      })
-    };
-  });
-}
+import { buildCoachTools } from "./tools";
+import { inlineDataUrls } from "./utils";
 
 export class ChatAgent extends AIChatAgent<Env> {
   maxPersistedMessages = 100;
@@ -107,103 +73,14 @@ If the user asks to be reminded of something later, use the scheduleTask tool.`,
         toolCalls: "before-last-2-messages"
       }),
       tools: {
-        // MCP tools from connected servers (e.g. the user's habit MCP)
         ...mcpTools,
-
-        // Client-side tool: the browser fills in the user's IANA timezone.
-        getUserTimezone: tool({
-          description:
-            "Get the user's IANA timezone from their browser. Call before getToday or getCurrentWeek if you don't already know it.",
-          inputSchema: z.object({})
-        }),
-
-        getToday: tool({
-          description:
-            "Return today's date as an ISO string (YYYY-MM-DD) in the user's timezone. Use this before querying habit-MCP tools that take a `date` argument.",
-          inputSchema: z.object({
-            timezone: z
-              .string()
-              .describe("IANA timezone, e.g. 'Europe/Helsinki'")
-          }),
-          execute: async ({ timezone }) => {
-            return { date: isoDateInTimezone(new Date(), timezone) };
-          }
-        }),
-
-        getCurrentWeek: tool({
-          description:
-            "Return the from/to ISO dates for the current week (Mon–Sun) in the user's timezone. Use this before list_days when the user asks about 'this week' or 'the past week'.",
-          inputSchema: z.object({
-            timezone: z
-              .string()
-              .describe("IANA timezone, e.g. 'Europe/Helsinki'")
-          }),
-          execute: async ({ timezone }) => {
-            const today = isoDateInTimezone(new Date(), timezone);
-            const [y, m, d] = today.split("-").map(Number);
-            const utc = new Date(Date.UTC(y, m - 1, d));
-            const dayOfWeek = (utc.getUTCDay() + 6) % 7; // Mon=0, Sun=6
-            const monday = new Date(utc);
-            monday.setUTCDate(utc.getUTCDate() - dayOfWeek);
-            const sunday = new Date(monday);
-            sunday.setUTCDate(monday.getUTCDate() + 6);
-            return {
-              from: monday.toISOString().slice(0, 10),
-              to: sunday.toISOString().slice(0, 10)
-            };
-          }
-        }),
-
-        scheduleTask: tool({
-          description:
-            "Schedule a task to be executed at a later time. Use this when the user asks to be reminded or wants something done later.",
-          inputSchema: scheduleSchema,
-          execute: async ({ when, description }) => {
-            if (when.type === "no-schedule") {
-              return "Not a valid schedule input";
-            }
-            const input =
-              when.type === "scheduled"
-                ? when.date
-                : when.type === "delayed"
-                  ? when.delayInSeconds
-                  : when.type === "cron"
-                    ? when.cron
-                    : null;
-            if (!input) return "Invalid schedule type";
-            try {
-              this.schedule(input, "executeTask", description, {
-                idempotent: true
-              });
-              return `Task scheduled: "${description}" (${when.type}: ${input})`;
-            } catch (error) {
-              return `Error scheduling task: ${error}`;
-            }
-          }
-        }),
-
-        getScheduledTasks: tool({
-          description: "List all tasks that have been scheduled",
-          inputSchema: z.object({}),
-          execute: async () => {
-            const tasks = this.getSchedules();
-            return tasks.length > 0 ? tasks : "No scheduled tasks found.";
-          }
-        }),
-
-        cancelScheduledTask: tool({
-          description: "Cancel a scheduled task by its ID",
-          inputSchema: z.object({
-            taskId: z.string().describe("The ID of the task to cancel")
-          }),
-          execute: async ({ taskId }) => {
-            try {
-              this.cancelSchedule(taskId);
-              return `Task ${taskId} cancelled.`;
-            } catch (error) {
-              return `Error cancelling task: ${error}`;
-            }
-          }
+        ...buildCoachTools({
+          schedule: (when, description) =>
+            this.schedule(when, "executeTask", description, {
+              idempotent: true
+            }),
+          getSchedules: () => this.getSchedules(),
+          cancelSchedule: (id) => this.cancelSchedule(id)
         })
       },
       stopWhen: stepCountIs(5),
@@ -214,7 +91,6 @@ If the user asks to be reminded of something later, use the scheduleTask tool.`,
   }
 
   async executeTask(description: string, _task: Schedule<string>) {
-    // Do the actual work here (send email, call API, etc.)
     console.log(`Executing scheduled task: ${description}`);
 
     // Notify connected clients via a broadcast event.
