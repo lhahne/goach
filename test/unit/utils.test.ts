@@ -1,6 +1,11 @@
 import { describe, expect, it } from "vitest";
 import type { ModelMessage } from "ai";
-import { inlineDataUrls, isoDateInTimezone, weekRange } from "../../src/utils";
+import {
+  dropStaleFileParts,
+  inlineDataUrls,
+  isoDateInTimezone,
+  weekRange
+} from "../../src/utils";
 
 describe("isoDateInTimezone", () => {
   it("formats UTC midnight in UTC", () => {
@@ -198,5 +203,72 @@ describe("inlineDataUrls", () => {
     expect(parts[0].type).toBe("text");
     expect(parts[1].data).toBeInstanceOf(Uint8Array);
     expect(parts[2].data).toBe("https://example.com/x.png");
+  });
+});
+
+describe("dropStaleFileParts", () => {
+  it("returns the array unchanged when there are no user messages", () => {
+    const messages: ModelMessage[] = [
+      { role: "system", content: "x" },
+      { role: "assistant", content: "y" }
+    ];
+    expect(dropStaleFileParts(messages)).toEqual(messages);
+  });
+
+  it("keeps the latest user message untouched (including its file parts)", () => {
+    const bytes = new Uint8Array([1, 2, 3]);
+    const messages: ModelMessage[] = [
+      { role: "user", content: [{ type: "file", data: bytes, mediaType: "image/png" }] }
+    ];
+    expect(dropStaleFileParts(messages)).toEqual(messages);
+  });
+
+  it("replaces file parts in older user messages with text placeholders", () => {
+    const bytes = new Uint8Array([1, 2, 3]);
+    const messages: ModelMessage[] = [
+      {
+        role: "user",
+        content: [
+          { type: "text", text: "look at this" },
+          { type: "file", data: bytes, mediaType: "image/png" }
+        ]
+      },
+      { role: "assistant", content: "ok" },
+      { role: "user", content: "and now this" }
+    ];
+    const out = dropStaleFileParts(messages);
+    const firstUserContent = out[0].content as Array<{ type: string; text?: string; data?: unknown }>;
+    expect(firstUserContent[0]).toEqual({ type: "text", text: "look at this" });
+    expect(firstUserContent[1]).toMatchObject({ type: "text" });
+    expect(firstUserContent[1].text).toMatch(/no longer in context/);
+    // The newer message keeps its plain string content untouched
+    expect(out[2]).toEqual({ role: "user", content: "and now this" });
+  });
+
+  it("does not touch assistant messages", () => {
+    const messages: ModelMessage[] = [
+      { role: "assistant", content: "earlier reply" },
+      { role: "user", content: "newer" }
+    ];
+    expect(dropStaleFileParts(messages)[0]).toEqual(messages[0]);
+  });
+
+  it("preserves text parts in older messages while only stripping file parts", () => {
+    const messages: ModelMessage[] = [
+      {
+        role: "user",
+        content: [
+          { type: "text", text: "keep this" },
+          { type: "file", data: new Uint8Array([0]), mediaType: "image/png" },
+          { type: "text", text: "and this" }
+        ]
+      },
+      { role: "user", content: "newest" }
+    ];
+    const out = dropStaleFileParts(messages);
+    const parts = out[0].content as Array<{ type: string; text?: string }>;
+    expect(parts.map((p) => p.type)).toEqual(["text", "text", "text"]);
+    expect(parts[0].text).toBe("keep this");
+    expect(parts[2].text).toBe("and this");
   });
 });

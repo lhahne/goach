@@ -55,3 +55,37 @@ export function inlineDataUrls(messages: ModelMessage[]): ModelMessage[] {
     };
   });
 }
+
+/**
+ * Replace file (image) parts in every user message except the most
+ * recent one with a small text placeholder.
+ *
+ * Why: persisted chat history is replayed to the model on every turn.
+ * Without this, every uploaded image keeps being decoded and resent on
+ * each follow-up message — making small turns exceed the 8 MB Workers
+ * AI request limit and slowing down the conversation. The model still
+ * sees that an image existed (so it can refer back to it conceptually)
+ * but the bytes only travel once.
+ */
+export function dropStaleFileParts(messages: ModelMessage[]): ModelMessage[] {
+  let lastUserIdx = -1;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i].role === "user") {
+      lastUserIdx = i;
+      break;
+    }
+  }
+  if (lastUserIdx < 0) return messages;
+  return messages.map((msg, i) => {
+    if (i === lastUserIdx) return msg;
+    if (msg.role !== "user" || typeof msg.content === "string") return msg;
+    return {
+      ...msg,
+      content: msg.content.map((part) =>
+        part.type === "file"
+          ? { type: "text" as const, text: "[image attachment, no longer in context]" }
+          : part
+      )
+    };
+  });
+}

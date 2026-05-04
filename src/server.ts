@@ -16,7 +16,7 @@ import {
   streamText
 } from "ai";
 import { buildCoachTools } from "./tools";
-import { inlineDataUrls } from "./utils";
+import { dropStaleFileParts, inlineDataUrls } from "./utils";
 import { gateAccess } from "./auth";
 
 // 30 days. Pending notifications older than this are pruned — a user
@@ -130,9 +130,19 @@ boundary land on the wrong day.
 ${getSchedulePrompt({ date: new Date() })}
 
 If the user asks to be reminded of something later, use the scheduleTask tool.`,
-      // Prune old tool calls to save tokens on long conversations
+      // Pipeline:
+      //  1. convertToModelMessages: persisted UI messages → ModelMessage[]
+      //  2. inlineDataUrls: turn data: URIs in the latest message into
+      //     Uint8Array so the AI SDK doesn't try to fetch them
+      //  3. dropStaleFileParts: replace file parts in older user
+      //     messages with a placeholder so we don't re-upload past
+      //     image bytes on every turn (otherwise small text follow-ups
+      //     blow past the 8 MB Workers AI request limit)
+      //  4. pruneMessages: drop old tool calls to save tokens
       messages: pruneMessages({
-        messages: inlineDataUrls(await convertToModelMessages(this.messages)),
+        messages: dropStaleFileParts(
+          inlineDataUrls(await convertToModelMessages(this.messages))
+        ),
         toolCalls: "before-last-2-messages"
       }),
       tools: mergeTools(
@@ -182,18 +192,24 @@ If the user asks to be reminded of something later, use the scheduleTask tool.`,
     await super.onConnect(connection, ctx);
     this.prunePending();
 
-    // Replay pending notifications to the new connection only. We don't
-    // use broadcast() here because live clients already saw the original
-    // broadcast at fire time. Note: with multiple devices/tabs, only the
-    // first one to reconnect gets the missed notifications — fine for a
-    // personal coach, would need per-connection delivery tracking otherwise.
-    const pending = this.sql<{ id: number; payload: string }>`
-      SELECT id, payload FROM pending_notifications ORDER BY id ASC
+    // Atomic select-and-delete via DELETE ... RETURNING. Avoids the
+    // race where two near-simultaneous reconnects could both read the
+    // same rows before either issued the DELETE and replay them twice
+    // — Durable Objects already serialize handler dispatch so the race
+    // is theoretical here, but RETURNING also reads cleaner than
+    // SELECT + DELETE-by-last-id and is one round trip instead of two.
+    //
+    // We don't use broadcast() because live clients already saw the
+    // original broadcast at fire time. With multiple devices/tabs,
+    // only the first one to reconnect gets the missed notifications —
+    // fine for a personal coach.
+    const drained = this.sql<{ id: number; payload: string }>`
+      DELETE FROM pending_notifications
+      RETURNING id, payload
     `;
-    if (pending.length === 0) return;
-    for (const row of pending) connection.send(row.payload);
-    const lastId = pending[pending.length - 1].id;
-    this.sql`DELETE FROM pending_notifications WHERE id <= ${lastId}`;
+    if (drained.length === 0) return;
+    drained.sort((a, b) => a.id - b.id);
+    for (const row of drained) connection.send(row.payload);
   }
 
   async executeTask(description: string, task: Schedule<string>) {

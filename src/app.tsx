@@ -66,24 +66,36 @@ function fileToDataUri(file: File): Promise<string> {
   });
 }
 
-// Per-image cap. Larger files blow past Workers AI input limits, take
-// a long time to base64-encode in the browser, and bloat the request
-// body unnecessarily. 5 MB is enough for a high-res phone photo and
-// short of Workers AI's 8 MB request limit.
-const MAX_ATTACHMENT_BYTES = 5 * 1024 * 1024;
-// Per-message cap on attachments. Multiple full-res photos per turn
-// quickly exceed memory and request-body limits.
-const MAX_ATTACHMENTS_PER_MESSAGE = 4;
+// Per-image raw byte cap. Base64 inflates by ~33% on the wire, so
+// 2 MB raw becomes ~2.7 MB encoded. Workers AI's request limit is
+// 8 MB total; this leaves plenty of headroom even at the message cap.
+const MAX_ATTACHMENT_BYTES = 2 * 1024 * 1024;
+// Per-message cap on attachment count. Three 2-MB images is ~8 MB of
+// base64, which is at the edge of what Workers AI accepts; we bias
+// conservative so combined bytes (next constant) is what actually
+// gates submission.
+const MAX_ATTACHMENTS_PER_MESSAGE = 3;
+// Combined raw byte cap across all attachments in a single message.
+// 4 MB raw → ~5.4 MB base64, comfortably under the 8 MB request limit
+// even with text + tool-call overhead.
+const MAX_TOTAL_ATTACHMENT_BYTES = 4 * 1024 * 1024;
 
 /**
- * Restrict popups opened from MCP-server-supplied URLs to http(s).
- * Blocks `javascript:`, `data:`, and other dangerous schemes that
- * would execute in the popup with our origin's permissions.
+ * Restrict popups opened from MCP-server-supplied URLs to https.
+ *
+ * Plain http: would let an on-path attacker tamper with the OAuth
+ * flow and capture the authorization code/token, so we don't accept
+ * it. Localhost is exempted because OAuth dev servers commonly bind
+ * to http://localhost — the request never leaves the device.
  */
 function isSafeAuthUrl(url: string): boolean {
   try {
     const u = new URL(url);
-    return u.protocol === "http:" || u.protocol === "https:";
+    if (u.protocol === "https:") return true;
+    if (u.protocol === "http:" && (u.hostname === "localhost" || u.hostname === "127.0.0.1" || u.hostname === "[::1]")) {
+      return true;
+    }
+    return false;
   } catch {
     return false;
   }
@@ -382,9 +394,17 @@ function Chat() {
     });
   }, [messages, isStreaming]);
 
-  // Re-focus the input after streaming ends
+  // Re-focus the composer when streaming ends — but only if focus is
+  // somewhere unimportant (no element / body) or already on the
+  // composer. Stealing focus from the MCP panel, a tool-approval
+  // prompt, or anywhere else the user has navigated to is hostile
+  // for keyboard and assistive-technology users.
   useEffect(() => {
-    if (!isStreaming && textareaRef.current) {
+    if (isStreaming || !textareaRef.current) return;
+    const active = document.activeElement;
+    const focusIsParked = active === document.body || active === null;
+    const focusOnComposer = active === textareaRef.current;
+    if (focusIsParked || focusOnComposer) {
       textareaRef.current.focus();
     }
   }, [isStreaming]);
@@ -411,16 +431,41 @@ function Chat() {
       if (accepted.length === 0) return;
 
       setAttachments((prev) => {
-        const room = MAX_ATTACHMENTS_PER_MESSAGE - prev.length;
-        const dropped = Math.max(0, accepted.length - room);
-        if (dropped > 0) {
+        const next = [...prev];
+        const skippedByCount: string[] = [];
+        const skippedByTotal: string[] = [];
+        let totalBytes = prev.reduce((sum, a) => sum + a.file.size, 0);
+
+        for (const f of accepted) {
+          if (next.length >= MAX_ATTACHMENTS_PER_MESSAGE) {
+            skippedByCount.push(f.name);
+            continue;
+          }
+          if (totalBytes + f.size > MAX_TOTAL_ATTACHMENT_BYTES) {
+            skippedByTotal.push(f.name);
+            continue;
+          }
+          next.push(createAttachment(f));
+          totalBytes += f.size;
+        }
+
+        if (skippedByCount.length > 0) {
           toasts.add({
             title: "Too many attachments",
-            description: `Up to ${MAX_ATTACHMENTS_PER_MESSAGE} images per message — ${dropped} skipped.`,
+            description: `Up to ${MAX_ATTACHMENTS_PER_MESSAGE} images per message — ${skippedByCount.length} skipped.`,
             timeout: 6000
           });
         }
-        return [...prev, ...accepted.slice(0, room).map(createAttachment)];
+        if (skippedByTotal.length > 0) {
+          toasts.add({
+            title: "Attachments too big combined",
+            description: `Combined attachments cap is ${Math.round(
+              MAX_TOTAL_ATTACHMENT_BYTES / 1024 / 1024
+            )} MB — ${skippedByTotal.length} skipped.`,
+            timeout: 6000
+          });
+        }
+        return next;
       });
     },
     [toasts]
@@ -475,12 +520,20 @@ function Chat() {
     [addFiles]
   );
 
-  // Re-entrancy guard. `isStreaming` only flips true after `sendMessage`
-  // is called, leaving a window during the parallel attachment reads
-  // where a second click/Enter would queue the same draft again. This
-  // ref is flipped synchronously at function entry and reset in the
-  // failure path, so concurrent calls bail out immediately.
+  // Re-entrancy guard. `isStreaming` only flips true a render or two
+  // after `sendMessage` is called, leaving a window where a second
+  // click/Enter would re-enter send() with the same closure values
+  // and queue the same draft twice. Once we set this ref true we
+  // hold it until isStreaming actually flips on (the agent has the
+  // request) — releasing it at the end of send() reopens the race.
   const isSendingRef = useRef(false);
+
+  // Release the re-entrancy guard when streaming ends (either it
+  // genuinely flipped true and back, or sendMessage failed before
+  // streaming started — covered by the catch path below).
+  useEffect(() => {
+    if (!isStreaming) isSendingRef.current = false;
+  }, [isStreaming]);
 
   const send = useCallback(async () => {
     if (isSendingRef.current) return;
@@ -523,8 +576,19 @@ function Chat() {
     for (const att of attachments) URL.revokeObjectURL(att.preview);
     setAttachments([]);
 
-    sendMessage({ role: "user", parts });
-    isSendingRef.current = false;
+    try {
+      sendMessage({ role: "user", parts });
+    } catch (e) {
+      // sendMessage throws synchronously → reset the guard so the user
+      // can retry. The effect above won't fire because isStreaming
+      // never flipped on.
+      isSendingRef.current = false;
+      throw e;
+    }
+    // Note: we do NOT reset isSendingRef here. The effect that watches
+    // isStreaming releases it after the agent has actually picked up
+    // the message and finished streaming — which is what closes the
+    // double-click race.
     if (textareaRef.current) textareaRef.current.style.height = "auto";
   }, [input, attachments, isStreaming, sendMessage, toasts]);
 
