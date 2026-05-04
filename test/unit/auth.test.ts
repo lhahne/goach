@@ -3,6 +3,7 @@ import { exportJWK, generateKeyPair, SignJWT, type JWTVerifyGetKey } from "jose"
 import {
   AccessAuthError,
   AccessConfigError,
+  gateAccess,
   readAccessConfig,
   verifyAccessJwt,
   type AccessConfig
@@ -236,5 +237,85 @@ describe("verifyAccessJwt: claim validation", () => {
         getKey: failingGetKey
       })
     ).rejects.toBe(networkError);
+  });
+});
+
+describe("gateAccess", () => {
+  it("returns null (pass through) when both vars are unset — local dev mode", async () => {
+    const req = new Request("https://goach.test/");
+    expect(await gateAccess(req, {})).toBeNull();
+  });
+
+  it("returns null when both vars are empty strings", async () => {
+    const req = new Request("https://goach.test/");
+    expect(
+      await gateAccess(req, { ACCESS_TEAM_DOMAIN: "", ACCESS_AUD: "" })
+    ).toBeNull();
+  });
+
+  it("returns 503 when only ACCESS_TEAM_DOMAIN is set (misconfiguration)", async () => {
+    const req = new Request("https://goach.test/");
+    const res = await gateAccess(req, {
+      ACCESS_TEAM_DOMAIN: TEAM_DOMAIN
+    });
+    expect(res?.status).toBe(503);
+  });
+
+  it("returns 503 when only ACCESS_AUD is set (misconfiguration)", async () => {
+    const req = new Request("https://goach.test/");
+    const res = await gateAccess(req, { ACCESS_AUD: AUD });
+    expect(res?.status).toBe(503);
+  });
+
+  it("returns 401 when no JWT is present and Access is enabled", async () => {
+    const req = new Request("https://goach.test/");
+    const res = await gateAccess(
+      req,
+      { ACCESS_TEAM_DOMAIN: TEAM_DOMAIN, ACCESS_AUD: AUD },
+      { getKey }
+    );
+    expect(res?.status).toBe(401);
+  });
+
+  it("returns 401 when the JWT is invalid (wrong audience)", async () => {
+    const token = await signToken({ aud: "some-other-app" });
+    const req = new Request("https://goach.test/", {
+      headers: { "Cf-Access-Jwt-Assertion": token }
+    });
+    const res = await gateAccess(
+      req,
+      { ACCESS_TEAM_DOMAIN: TEAM_DOMAIN, ACCESS_AUD: AUD },
+      { getKey }
+    );
+    expect(res?.status).toBe(401);
+  });
+
+  it("returns null (pass through) when a valid JWT is provided", async () => {
+    const token = await signToken();
+    const req = new Request("https://goach.test/", {
+      headers: { "Cf-Access-Jwt-Assertion": token }
+    });
+    const res = await gateAccess(
+      req,
+      { ACCESS_TEAM_DOMAIN: TEAM_DOMAIN, ACCESS_AUD: AUD },
+      { getKey }
+    );
+    expect(res).toBeNull();
+  });
+
+  it("returns 503 (not 401) when JWKS fetch fails — distinguishes infra outage from bad token", async () => {
+    const token = await signToken();
+    const req = new Request("https://goach.test/", {
+      headers: { "Cf-Access-Jwt-Assertion": token }
+    });
+    const failingGetKey: JWTVerifyGetKey = async () => {
+      throw new Error("Network unreachable: JWKS fetch failed");
+    };
+    const res = await gateAccess(
+      req,
+      { ACCESS_TEAM_DOMAIN: TEAM_DOMAIN, ACCESS_AUD: AUD },
+      { getKey: failingGetKey }
+    );
+    expect(res?.status).toBe(503);
   });
 });

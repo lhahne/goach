@@ -107,6 +107,53 @@ export async function verifyAccessJwt(
   }
 }
 
+/**
+ * Gate the worker's fetch handler on a valid Cloudflare Access JWT.
+ *
+ * Returns:
+ *  - `null` when the request should pass through (auth disabled because
+ *    both env vars are unset, OR auth enabled and the JWT verifies)
+ *  - a 401 Response when the JWT is missing or invalid
+ *  - a 503 Response when Access is partially configured, OR when verifying
+ *    the JWT fails for an infrastructure reason (e.g. JWKS endpoint
+ *    unreachable). 503 keeps the user from being told their token is
+ *    bad when the actual problem is on our side.
+ *
+ * Extracted from the fetch handler so the branches are unit-testable
+ * without spinning up workerd.
+ */
+export async function gateAccess(
+  request: Request,
+  env: { ACCESS_TEAM_DOMAIN?: string; ACCESS_AUD?: string },
+  options: { getKey?: JWTVerifyGetKey } = {}
+): Promise<Response | null> {
+  let access: AccessConfig | null;
+  try {
+    access = readAccessConfig(env);
+  } catch (err) {
+    if (err instanceof AccessConfigError) {
+      console.error("Access misconfigured:", err.message);
+      return new Response("Service Unavailable", { status: 503 });
+    }
+    throw err;
+  }
+  if (!access) return null;
+
+  const cfg: AccessConfig = options.getKey
+    ? { ...access, getKey: options.getKey }
+    : access;
+  try {
+    await verifyAccessJwt(request, cfg);
+    return null;
+  } catch (err) {
+    if (err instanceof AccessAuthError) {
+      return new Response("Unauthorized", { status: 401 });
+    }
+    console.error("Access verification failed unexpectedly:", err);
+    return new Response("Service Unavailable", { status: 503 });
+  }
+}
+
 function extractToken(request: Request): string | undefined {
   const header = request.headers.get("cf-access-jwt-assertion");
   if (header) return header;

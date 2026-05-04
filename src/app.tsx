@@ -66,6 +66,20 @@ function fileToDataUri(file: File): Promise<string> {
   });
 }
 
+/**
+ * Restrict popups opened from MCP-server-supplied URLs to http(s).
+ * Blocks `javascript:`, `data:`, and other dangerous schemes that
+ * would execute in the popup with our origin's permissions.
+ */
+function isSafeAuthUrl(url: string): boolean {
+  try {
+    const u = new URL(url);
+    return u.protocol === "http:" || u.protocol === "https:";
+  } catch {
+    return false;
+  }
+}
+
 // ── Small components ──────────────────────────────────────────────────
 
 function ThemeToggle() {
@@ -626,7 +640,8 @@ function Chat() {
                             </div>
                             <div className="flex items-center gap-1 shrink-0 ml-2">
                               {server.state === "authenticating" &&
-                                server.auth_url && (
+                                server.auth_url &&
+                                isSafeAuthUrl(server.auth_url as string) && (
                                   <Button
                                     variant="primary"
                                     size="sm"
@@ -635,6 +650,9 @@ function Chat() {
                                       // noopener/noreferrer: auth_url comes
                                       // from the connected MCP server, so
                                       // don't expose window.opener to it.
+                                      // The protocol is restricted to http(s)
+                                      // by isSafeAuthUrl above to block
+                                      // javascript:/data: URLs.
                                       window.open(
                                         server.auth_url as string,
                                         "oauth",
@@ -706,7 +724,7 @@ function Chat() {
                       key={prompt}
                       variant="outline"
                       size="sm"
-                      disabled={isStreaming}
+                      disabled={!connected || isStreaming}
                       onClick={() => {
                         sendMessage({
                           role: "user",
@@ -886,7 +904,7 @@ function Chat() {
                   <button
                     type="button"
                     onClick={() => removeAttachment(att.id)}
-                    className="absolute top-0.5 right-0.5 rounded-full bg-kumo-contrast/80 text-kumo-inverse p-0.5 opacity-0 group-hover:opacity-100 transition-opacity"
+                    className="absolute top-0.5 right-0.5 rounded-full bg-kumo-contrast/80 text-kumo-inverse p-0.5 opacity-0 group-hover:opacity-100 focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-kumo-accent transition-opacity"
                     aria-label={`Remove ${att.file.name}`}
                   >
                     <XIcon size={10} />

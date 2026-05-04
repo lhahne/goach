@@ -17,12 +17,7 @@ import {
 } from "ai";
 import { buildCoachTools } from "./tools";
 import { inlineDataUrls } from "./utils";
-import {
-  AccessAuthError,
-  AccessConfigError,
-  readAccessConfig,
-  verifyAccessJwt
-} from "./auth";
+import { gateAccess } from "./auth";
 
 // 30 days. Pending notifications older than this are dropped on next
 // connect — a user who's been silent for a month doesn't need a backlog.
@@ -185,37 +180,12 @@ If the user asks to be reminded of something later, use the scheduleTask tool.`,
 
 export default {
   async fetch(request: Request, env: Env) {
-    // Cloudflare Access gate. When ACCESS_TEAM_DOMAIN + ACCESS_AUD are
-    // both set, every request must carry a valid Access JWT (Access
-    // injects it into the Cf-Access-Jwt-Assertion header, also accept
-    // the CF_Authorization cookie). When both are unset, validation is
-    // skipped so local `npm run dev` works without an Access app. When
-    // exactly one is set, readAccessConfig throws so we fail closed
-    // (503) instead of silently leaving the worker unauthenticated.
-    let access: ReturnType<typeof readAccessConfig>;
-    try {
-      access = readAccessConfig(env);
-    } catch (err) {
-      if (err instanceof AccessConfigError) {
-        console.error("Access misconfigured:", err.message);
-        return new Response("Service Unavailable", { status: 503 });
-      }
-      throw err;
-    }
-    if (access) {
-      try {
-        await verifyAccessJwt(request, access);
-      } catch (err) {
-        if (err instanceof AccessAuthError) {
-          return new Response("Unauthorized", { status: 401 });
-        }
-        // Non-jose error (e.g. JWKS endpoint unreachable). Fail closed
-        // with 503 so we don't pretend the user's token is bad — and
-        // logs make it possible to distinguish auth from infrastructure.
-        console.error("Access verification failed unexpectedly:", err);
-        return new Response("Service Unavailable", { status: 503 });
-      }
-    }
+    // Cloudflare Access gate. See gateAccess() for full semantics. Both
+    // env vars unset → auth disabled (local dev). Both set → JWT must
+    // verify. Exactly one set → 503 (misconfig). JWT invalid → 401.
+    // JWKS unreachable → 503.
+    const blocked = await gateAccess(request, env);
+    if (blocked) return blocked;
     return (
       (await routeAgentRequest(request, env)) ||
       new Response("Not found", { status: 404 })

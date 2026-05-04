@@ -1,6 +1,10 @@
 import { describe, expect, it, vi } from "vitest";
 import type { ToolCallOptions } from "ai";
-import { buildCoachTools, type CoachToolDeps } from "../../src/tools";
+import {
+  buildCoachTools,
+  timezoneSchema,
+  type CoachToolDeps
+} from "../../src/tools";
 
 function makeDeps(overrides: Partial<CoachToolDeps> = {}): CoachToolDeps {
   return {
@@ -76,6 +80,27 @@ describe("getToday", () => {
       date: string;
     };
     expect(result.date).toMatch(/^\d{4}-\d{2}-\d{2}$/);
+  });
+});
+
+describe("timezoneSchema (shared validation for all tz-using tools)", () => {
+  it.each(["UTC", "Europe/Helsinki", "America/Los_Angeles", "Asia/Tokyo"])(
+    "accepts %s",
+    (tz) => {
+      expect(timezoneSchema.safeParse(tz).success).toBe(true);
+    }
+  );
+
+  it.each(["Not/A_Real_Zone", "europe/helsinki ", "Mars/Phobos", "", " "])(
+    "rejects %s",
+    (tz) => {
+      expect(timezoneSchema.safeParse(tz).success).toBe(false);
+    }
+  );
+
+  it("rejects garbage that would otherwise throw RangeError in Intl.DateTimeFormat", () => {
+    const result = timezoneSchema.safeParse("DROP TABLE timezones;--");
+    expect(result.success).toBe(false);
   });
 });
 

@@ -4,6 +4,30 @@ import { z } from "zod";
 import { isoDateInTimezone, weekRange } from "./utils";
 
 /**
+ * Reject invalid IANA timezones at the schema layer so the AI SDK can
+ * surface a structured validation error to the model (which can then
+ * retry with a corrected zone), instead of letting Intl.DateTimeFormat
+ * throw a RangeError that fails the whole tool call.
+ */
+export const timezoneSchema = z
+  .string()
+  .describe("IANA timezone, e.g. 'Europe/Helsinki'")
+  .refine(
+    (tz) => {
+      try {
+        new Intl.DateTimeFormat("en-CA", { timeZone: tz });
+        return true;
+      } catch {
+        return false;
+      }
+    },
+    {
+      message:
+        "Invalid IANA timezone. Use a name like 'UTC', 'Europe/Helsinki', or 'America/Los_Angeles'."
+    }
+  );
+
+/**
  * Pre-bound dependencies the coach tools need from the surrounding agent.
  * Closures rather than methods so the agent's strict `keyof this` callback
  * type doesn't leak in here, and tests can pass plain fakes.
@@ -35,7 +59,7 @@ export function buildCoachTools(
       description:
         "Return today's date as an ISO string (YYYY-MM-DD) in the user's timezone. Use this before querying habit-MCP tools that take a `date` argument.",
       inputSchema: z.object({
-        timezone: z.string().describe("IANA timezone, e.g. 'Europe/Helsinki'")
+        timezone: timezoneSchema
       }),
       execute: async ({ timezone }) => {
         return { date: isoDateInTimezone(now(), timezone) };
@@ -46,7 +70,7 @@ export function buildCoachTools(
       description:
         "Return the from/to ISO dates for the current calendar week (Monday through Sunday) in the user's timezone. Use this when the user asks about 'this week'. For 'the past week', 'the last 7 days', or any rolling window, use getRecentDays instead.",
       inputSchema: z.object({
-        timezone: z.string().describe("IANA timezone, e.g. 'Europe/Helsinki'")
+        timezone: timezoneSchema
       }),
       execute: async ({ timezone }) => {
         return weekRange(isoDateInTimezone(now(), timezone));
@@ -63,7 +87,7 @@ export function buildCoachTools(
           .min(1)
           .max(365)
           .describe("Number of days back from today, inclusive of today."),
-        timezone: z.string().describe("IANA timezone, e.g. 'Europe/Helsinki'")
+        timezone: timezoneSchema
       }),
       execute: async ({ days, timezone }) => {
         const today = isoDateInTimezone(now(), timezone);
