@@ -19,9 +19,37 @@ import { buildCoachTools } from "./tools";
 import { inlineDataUrls } from "./utils";
 import { gateAccess } from "./auth";
 
-// 30 days. Pending notifications older than this are dropped on next
-// connect — a user who's been silent for a month doesn't need a backlog.
+// 30 days. Pending notifications older than this are pruned — a user
+// who's been silent for a month doesn't need a backlog.
 const PENDING_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+// Hard cap on how many pending notifications we'll hold for a single
+// agent at once. Trims the oldest beyond this threshold so the table
+// can't grow without bound while a cron reminder fires repeatedly with
+// no client ever connecting.
+const PENDING_MAX_ROWS = 100;
+
+/**
+ * Merge built-in coach tools with tools from connected MCP servers.
+ *
+ * MCP wins on collision: the user explicitly added that server, so a
+ * tool they brought in should take precedence over a generically-named
+ * built-in (otherwise "connect any MCP server" silently breaks for
+ * servers that expose `getToday`, `scheduleTask`, etc.). Collisions are
+ * logged so the operator notices the shadowing.
+ */
+function mergeTools<A extends object, B extends object>(
+  builtins: A,
+  mcp: B
+): A & B {
+  for (const name of Object.keys(mcp)) {
+    if (name in builtins) {
+      console.warn(
+        `Tool name collision: connected MCP server's '${name}' shadows the built-in coach tool of the same name.`
+      );
+    }
+  }
+  return { ...builtins, ...mcp } as A & B;
+}
 
 export class ChatAgent extends AIChatAgent<Env> {
   maxPersistedMessages = 100;
@@ -87,11 +115,17 @@ export class ChatAgent extends AIChatAgent<Env> {
 
 When the user has connected a habit MCP server, prefer reading their actual data
 (list_habits, list_days, get_day, search_text) before giving advice. Cite specific
-dates and numbers. Use getToday and getCurrentWeek to anchor date queries — never
-guess today's date. When writing data on the user's behalf (set_day_*,
-upsert_check_in, create_habit, update_habit), confirm intent first.
+dates and numbers. Use getToday, getCurrentWeek, and getRecentDays to anchor date
+queries — never guess today's date. When writing data on the user's behalf
+(set_day_*, upsert_check_in, create_habit, update_habit), confirm intent first.
 
 Be direct, kind, and specific. Skip generic motivational filler.
+
+The schedule prompt below uses the worker's UTC clock. For relative scheduling
+("tomorrow at 8", "next Monday morning"), call getUserTimezone first, then
+getToday, and translate the user's wall-clock time into an absolute ISO instant
+before invoking scheduleTask. Without this step, reminders near a UTC day
+boundary land on the wrong day.
 
 ${getSchedulePrompt({ date: new Date() })}
 
@@ -101,33 +135,52 @@ If the user asks to be reminded of something later, use the scheduleTask tool.`,
         messages: inlineDataUrls(await convertToModelMessages(this.messages)),
         toolCalls: "before-last-2-messages"
       }),
-      tools: {
-        ...mcpTools,
-        ...buildCoachTools({
+      tools: mergeTools(
+        buildCoachTools({
           schedule: (when, description) =>
             this.schedule(when, "executeTask", description, {
               idempotent: true
             }),
           getSchedules: () => this.getSchedules(),
           cancelSchedule: (id) => this.cancelSchedule(id)
-        })
-      },
-      stopWhen: stepCountIs(5),
+        }),
+        mcpTools
+      ),
+      // 10 not 5: a typical "review my week" turn chains
+      // getUserTimezone → getCurrentWeek → list_days → list_habits →
+      // (optional) write check-ins → final message. Five steps wasn't
+      // enough headroom; ten lets the model finish without runaway loops.
+      stopWhen: stepCountIs(10),
       abortSignal: options?.abortSignal
     });
 
     return result.toUIMessageStreamResponse();
   }
 
-  async onConnect(connection: Connection, ctx: ConnectionContext) {
-    await super.onConnect(connection, ctx);
-
-    // Drop notifications older than the TTL — keeps the table from
-    // growing if the user goes silent for months.
+  /**
+   * Bound the pending_notifications queue: drop entries older than the
+   * TTL and trim the oldest beyond the row cap. Called from both insert
+   * and replay paths so the queue stays bounded even if the user never
+   * reconnects.
+   */
+  private prunePending(): void {
     this.sql`
       DELETE FROM pending_notifications
       WHERE created_at < ${Date.now() - PENDING_TTL_MS}
     `;
+    this.sql`
+      DELETE FROM pending_notifications
+      WHERE id NOT IN (
+        SELECT id FROM pending_notifications
+        ORDER BY id DESC
+        LIMIT ${PENDING_MAX_ROWS}
+      )
+    `;
+  }
+
+  async onConnect(connection: Connection, ctx: ConnectionContext) {
+    await super.onConnect(connection, ctx);
+    this.prunePending();
 
     // Replay pending notifications to the new connection only. We don't
     // use broadcast() here because live clients already saw the original
@@ -174,6 +227,10 @@ If the user asks to be reminded of something later, use the scheduleTask tool.`,
         INSERT INTO pending_notifications (payload, created_at)
         VALUES (${payload}, ${Date.now()})
       `;
+      // Prune on every insert so the queue stays bounded even when the
+      // user never reconnects (e.g. cron reminder firing every day for
+      // months). Without this, the SQLite table can grow unboundedly.
+      this.prunePending();
     }
   }
 }

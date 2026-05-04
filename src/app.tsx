@@ -66,6 +66,15 @@ function fileToDataUri(file: File): Promise<string> {
   });
 }
 
+// Per-image cap. Larger files blow past Workers AI input limits, take
+// a long time to base64-encode in the browser, and bloat the request
+// body unnecessarily. 5 MB is enough for a high-res phone photo and
+// short of Workers AI's 8 MB request limit.
+const MAX_ATTACHMENT_BYTES = 5 * 1024 * 1024;
+// Per-message cap on attachments. Multiple full-res photos per turn
+// quickly exceed memory and request-body limits.
+const MAX_ATTACHMENTS_PER_MESSAGE = 4;
+
 /**
  * Restrict popups opened from MCP-server-supplied URLs to http(s).
  * Blocks `javascript:`, `data:`, and other dangerous schemes that
@@ -364,8 +373,14 @@ function Chat() {
   const isStreaming = status === "streaming" || status === "submitted";
 
   useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [messages]);
+    // Smooth scroll restarts the animation on every streamed chunk and
+    // fights with the user's manual scrolling. Use instant scroll while
+    // streaming; smooth only on message boundaries (post-stream, or
+    // when a new user message lands).
+    messagesEndRef.current?.scrollIntoView({
+      behavior: isStreaming ? "auto" : "smooth"
+    });
+  }, [messages, isStreaming]);
 
   // Re-focus the input after streaming ends
   useEffect(() => {
@@ -374,11 +389,42 @@ function Chat() {
     }
   }, [isStreaming]);
 
-  const addFiles = useCallback((files: FileList | File[]) => {
-    const images = Array.from(files).filter((f) => f.type.startsWith("image/"));
-    if (images.length === 0) return;
-    setAttachments((prev) => [...prev, ...images.map(createAttachment)]);
-  }, []);
+  const addFiles = useCallback(
+    (files: FileList | File[]) => {
+      const images = Array.from(files).filter((f) =>
+        f.type.startsWith("image/")
+      );
+      if (images.length === 0) return;
+
+      const oversized = images.filter((f) => f.size > MAX_ATTACHMENT_BYTES);
+      const accepted = images.filter((f) => f.size <= MAX_ATTACHMENT_BYTES);
+
+      if (oversized.length > 0) {
+        toasts.add({
+          title: `Attachment too large`,
+          description: `${oversized.length} file(s) exceed ${Math.round(
+            MAX_ATTACHMENT_BYTES / 1024 / 1024
+          )} MB and were skipped.`,
+          timeout: 6000
+        });
+      }
+      if (accepted.length === 0) return;
+
+      setAttachments((prev) => {
+        const room = MAX_ATTACHMENTS_PER_MESSAGE - prev.length;
+        const dropped = Math.max(0, accepted.length - room);
+        if (dropped > 0) {
+          toasts.add({
+            title: "Too many attachments",
+            description: `Up to ${MAX_ATTACHMENTS_PER_MESSAGE} images per message — ${dropped} skipped.`,
+            timeout: 6000
+          });
+        }
+        return [...prev, ...accepted.slice(0, room).map(createAttachment)];
+      });
+    },
+    [toasts]
+  );
 
   const removeAttachment = useCallback((id: string) => {
     setAttachments((prev) => {
@@ -429,9 +475,18 @@ function Chat() {
     [addFiles]
   );
 
+  // Re-entrancy guard. `isStreaming` only flips true after `sendMessage`
+  // is called, leaving a window during the parallel attachment reads
+  // where a second click/Enter would queue the same draft again. This
+  // ref is flipped synchronously at function entry and reset in the
+  // failure path, so concurrent calls bail out immediately.
+  const isSendingRef = useRef(false);
+
   const send = useCallback(async () => {
+    if (isSendingRef.current) return;
     const text = input.trim();
     if ((!text && attachments.length === 0) || isStreaming) return;
+    isSendingRef.current = true;
 
     const parts: Array<
       | { type: "text"; text: string }
@@ -450,6 +505,7 @@ function Chat() {
       );
     } catch (e) {
       console.error("Failed to read attachment:", e);
+      isSendingRef.current = false;
       toasts.add({
         title: "Couldn't read attachment",
         description:
@@ -468,6 +524,7 @@ function Chat() {
     setAttachments([]);
 
     sendMessage({ role: "user", parts });
+    isSendingRef.current = false;
     if (textareaRef.current) textareaRef.current.style.height = "auto";
   }, [input, attachments, isStreaming, sendMessage, toasts]);
 
@@ -753,31 +810,35 @@ function Chat() {
                   </pre>
                 )}
 
-                {/* Tool parts */}
-                {message.parts.filter(isToolUIPart).map((part) => (
-                  <ToolPartView
-                    key={part.toolCallId}
-                    part={part}
-                    addToolApprovalResponse={addToolApprovalResponse}
-                  />
-                ))}
+                {/* Render parts in their original array order so a user
+                    message with text-then-image displays text first, and
+                    assistant messages with interleaved tool/reasoning/text
+                    render the chain in the order the model emitted them.
+                    Previously each part-type was filtered into its own
+                    pass which forced a fixed visual order regardless of
+                    the message's actual structure. */}
+                {message.parts.map((part, i) => {
+                  if (isToolUIPart(part)) {
+                    return (
+                      <ToolPartView
+                        key={part.toolCallId ?? `tool-${i}`}
+                        part={part}
+                        addToolApprovalResponse={addToolApprovalResponse}
+                      />
+                    );
+                  }
 
-                {/* Reasoning parts */}
-                {message.parts
-                  .filter(
-                    (part) =>
-                      part.type === "reasoning" &&
-                      (part as { text?: string }).text?.trim()
-                  )
-                  .map((part, i) => {
+                  if (part.type === "reasoning") {
                     const reasoning = part as {
                       type: "reasoning";
-                      text: string;
+                      text?: string;
                       state?: "streaming" | "done";
                     };
-                    const isDone = reasoning.state === "done" || !isStreaming;
+                    if (!reasoning.text?.trim()) return null;
+                    const isDone =
+                      reasoning.state === "done" || !isStreaming;
                     return (
-                      <div key={i} className="flex justify-start">
+                      <div key={`reasoning-${i}`} className="flex justify-start">
                         <details className="max-w-[85%] w-full" open={!isDone}>
                           <summary className="flex items-center gap-2 cursor-pointer px-3 py-2 rounded-lg bg-purple-500/10 border border-purple-500/20 text-sm select-none">
                             <BrainIcon size={14} className="text-purple-400" />
@@ -804,49 +865,43 @@ function Chat() {
                         </details>
                       </div>
                     );
-                  })}
+                  }
 
-                {/* Image parts */}
-                {message.parts
-                  .filter(
-                    (part): part is Extract<typeof part, { type: "file" }> =>
-                      part.type === "file" &&
-                      (part as { mediaType?: string }).mediaType?.startsWith(
-                        "image/"
-                      ) === true
-                  )
-                  .map((part, i) => (
-                    <div
-                      key={`file-${i}`}
-                      className={`flex ${isUser ? "justify-end" : "justify-start"}`}
-                    >
-                      <img
-                        src={part.url}
-                        alt="Attachment"
-                        className="max-h-64 rounded-xl border border-kumo-line object-contain"
-                      />
-                    </div>
-                  ))}
+                  if (
+                    part.type === "file" &&
+                    (part as { mediaType?: string }).mediaType?.startsWith(
+                      "image/"
+                    )
+                  ) {
+                    const filePart = part as { type: "file"; url: string };
+                    return (
+                      <div
+                        key={`file-${i}`}
+                        className={`flex ${isUser ? "justify-end" : "justify-start"}`}
+                      >
+                        <img
+                          src={filePart.url}
+                          alt="Attachment"
+                          className="max-h-64 rounded-xl border border-kumo-line object-contain"
+                        />
+                      </div>
+                    );
+                  }
 
-                {/* Text parts */}
-                {message.parts
-                  .filter((part) => part.type === "text")
-                  .map((part, i) => {
+                  if (part.type === "text") {
                     const text = (part as { type: "text"; text: string }).text;
                     if (!text) return null;
-
                     if (isUser) {
                       return (
-                        <div key={i} className="flex justify-end">
+                        <div key={`text-${i}`} className="flex justify-end">
                           <div className="max-w-[85%] px-4 py-2.5 rounded-2xl rounded-br-md bg-kumo-contrast text-kumo-inverse leading-relaxed">
                             {text}
                           </div>
                         </div>
                       );
                     }
-
                     return (
-                      <div key={i} className="flex justify-start">
+                      <div key={`text-${i}`} className="flex justify-start">
                         <div className="max-w-[85%] rounded-2xl rounded-bl-md bg-kumo-base text-kumo-default leading-relaxed">
                           <Streamdown
                             className="sd-theme rounded-2xl rounded-bl-md p-3"
@@ -859,7 +914,10 @@ function Chat() {
                         </div>
                       </div>
                     );
-                  })}
+                  }
+
+                  return null;
+                })}
               </div>
             );
           })}
