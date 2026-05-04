@@ -32,6 +32,7 @@ describe("buildCoachTools", () => {
       [
         "cancelScheduledTask",
         "getCurrentWeek",
+        "getRecentDays",
         "getScheduledTasks",
         "getToday",
         "getUserTimezone",
@@ -97,6 +98,44 @@ describe("getCurrentWeek", () => {
     expect(
       await run(tools.getCurrentWeek.execute, { timezone: "Europe/Helsinki" })
     ).toEqual({ from: "2026-05-04", to: "2026-05-10" });
+  });
+});
+
+describe("getRecentDays", () => {
+  it("returns a rolling window ending today (inclusive)", async () => {
+    const fixed = new Date("2026-05-06T12:00:00Z"); // Wednesday UTC
+    const tools = buildCoachTools(makeDeps(), () => fixed);
+    expect(
+      await run(tools.getRecentDays.execute, { days: 7, timezone: "UTC" })
+    ).toEqual({ from: "2026-04-30", to: "2026-05-06" });
+  });
+
+  it("days=1 means today only", async () => {
+    const fixed = new Date("2026-05-06T12:00:00Z");
+    const tools = buildCoachTools(makeDeps(), () => fixed);
+    expect(
+      await run(tools.getRecentDays.execute, { days: 1, timezone: "UTC" })
+    ).toEqual({ from: "2026-05-06", to: "2026-05-06" });
+  });
+
+  it("crosses month boundaries correctly", async () => {
+    const fixed = new Date("2026-05-03T12:00:00Z");
+    const tools = buildCoachTools(makeDeps(), () => fixed);
+    expect(
+      await run(tools.getRecentDays.execute, { days: 7, timezone: "UTC" })
+    ).toEqual({ from: "2026-04-27", to: "2026-05-03" });
+  });
+
+  it("respects timezone when computing 'today'", async () => {
+    // 22:00 UTC = 01:00 next day in Helsinki summer
+    const fixed = new Date("2026-05-03T22:00:00Z");
+    const tools = buildCoachTools(makeDeps(), () => fixed);
+    expect(
+      await run(tools.getRecentDays.execute, {
+        days: 7,
+        timezone: "Europe/Helsinki"
+      })
+    ).toEqual({ from: "2026-04-28", to: "2026-05-04" });
   });
 });
 

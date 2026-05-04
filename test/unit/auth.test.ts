@@ -216,4 +216,25 @@ describe("verifyAccessJwt: claim validation", () => {
       AccessAuthError
     );
   });
+
+  it("propagates non-jose errors (e.g. JWKS network failure) instead of wrapping them as AccessAuthError", async () => {
+    const networkError = new Error("Network unreachable: JWKS fetch failed");
+    const failingGetKey: JWTVerifyGetKey = async () => {
+      throw networkError;
+    };
+    const token = await signToken();
+    const req = new Request("https://goach.test/", {
+      headers: { "Cf-Access-Jwt-Assertion": token }
+    });
+    // The error must propagate as the original — NOT wrapped as
+    // AccessAuthError — so the fetch handler can return 503 (infrastructure)
+    // instead of 401 (bad token).
+    await expect(
+      verifyAccessJwt(req, {
+        teamDomain: TEAM_DOMAIN,
+        aud: AUD,
+        getKey: failingGetKey
+      })
+    ).rejects.toBe(networkError);
+  });
 });

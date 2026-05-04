@@ -44,12 +44,34 @@ export function buildCoachTools(
 
     getCurrentWeek: tool({
       description:
-        "Return the from/to ISO dates for the current week (Mon–Sun) in the user's timezone. Use this before list_days when the user asks about 'this week' or 'the past week'.",
+        "Return the from/to ISO dates for the current calendar week (Monday through Sunday) in the user's timezone. Use this when the user asks about 'this week'. For 'the past week', 'the last 7 days', or any rolling window, use getRecentDays instead.",
       inputSchema: z.object({
         timezone: z.string().describe("IANA timezone, e.g. 'Europe/Helsinki'")
       }),
       execute: async ({ timezone }) => {
         return weekRange(isoDateInTimezone(now(), timezone));
+      }
+    }),
+
+    getRecentDays: tool({
+      description:
+        "Return the from/to ISO dates for the last N days ending today (rolling window) in the user's timezone. Use this for 'the past week' (days=7), 'the last month' (days=30), 'last 3 days' (days=3), etc. Pair with list_days from a habit MCP.",
+      inputSchema: z.object({
+        days: z
+          .number()
+          .int()
+          .min(1)
+          .max(365)
+          .describe("Number of days back from today, inclusive of today."),
+        timezone: z.string().describe("IANA timezone, e.g. 'Europe/Helsinki'")
+      }),
+      execute: async ({ days, timezone }) => {
+        const today = isoDateInTimezone(now(), timezone);
+        const [y, m, d] = today.split("-").map(Number);
+        const utc = new Date(Date.UTC(y, m - 1, d));
+        const from = new Date(utc);
+        from.setUTCDate(utc.getUTCDate() - (days - 1));
+        return { from: from.toISOString().slice(0, 10), to: today };
       }
     }),
 

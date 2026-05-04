@@ -159,17 +159,27 @@ If the user asks to be reminded of something later, use the scheduleTask tool.`,
       timestamp: new Date().toISOString()
     });
 
-    // Persist before broadcasting so a thrown broadcast still leaves
-    // the notification recoverable on next connect.
-    this.sql`
-      INSERT INTO pending_notifications (payload, created_at)
-      VALUES (${payload}, ${Date.now()})
-    `;
-
+    // If at least one client is connected, broadcast live and skip the
+    // queue — otherwise the row would still be there on next connect
+    // and the user would see the same toast twice. If nobody's listening,
+    // persist so onConnect replays it on reconnect.
+    //
     // We use broadcast() instead of saveMessages() to avoid injecting
     // into chat history — the AI would see the notification as new
     // context and potentially loop.
-    this.broadcast(payload);
+    let hasLiveClient = false;
+    for (const _conn of this.getConnections()) {
+      hasLiveClient = true;
+      break;
+    }
+    if (hasLiveClient) {
+      this.broadcast(payload);
+    } else {
+      this.sql`
+        INSERT INTO pending_notifications (payload, created_at)
+        VALUES (${payload}, ${Date.now()})
+      `;
+    }
   }
 }
 
@@ -199,7 +209,11 @@ export default {
         if (err instanceof AccessAuthError) {
           return new Response("Unauthorized", { status: 401 });
         }
-        throw err;
+        // Non-jose error (e.g. JWKS endpoint unreachable). Fail closed
+        // with 503 so we don't pretend the user's token is bad — and
+        // logs make it possible to distinguish auth from infrastructure.
+        console.error("Access verification failed unexpectedly:", err);
+        return new Response("Service Unavailable", { status: 503 });
       }
     }
     return (

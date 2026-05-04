@@ -51,8 +51,8 @@ etc. on your habit MCP and reason over the results.
 
 ```bash
 npm test                # full suite (unit + workers)
-npm run test:unit       # node-only unit tests for src/utils.ts and src/tools.ts
-npm run test:workers    # workerd integration smoke test (Durable Object boots, fetch routes)
+npm run test:unit       # node-only unit tests for src/utils.ts, src/tools.ts, src/auth.ts
+npm run test:workers    # workerd integration tests (DO boot, fetch routes, durable notifications)
 npm run test:coverage   # v8 coverage report for the unit project
 npm run test:watch      # vitest in watch mode
 ```

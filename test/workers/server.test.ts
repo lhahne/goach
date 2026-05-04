@@ -73,7 +73,7 @@ function scheduledTaskFrames(sent: string[]): Array<{ description: string }> {
 }
 
 describe("durable scheduled-task notifications", () => {
-  it("persists the payload when executeTask fires", async () => {
+  it("persists the payload when no clients are connected at fire time", async () => {
     const id = env.ChatAgent.idFromName("notif-persist");
     const stub = env.ChatAgent.get(id);
     await runInDurableObject<ChatAgent, void>(stub, async (agent) => {
@@ -90,6 +90,33 @@ describe("durable scheduled-task notifications", () => {
       });
       expect(typeof parsed.timestamp).toBe("string");
       expect(rows[0].created_at).toBeGreaterThan(0);
+    });
+  });
+
+  it("does NOT persist when at least one client is already connected (no double-delivery on next reconnect)", async () => {
+    const id = env.ChatAgent.idFromName("notif-no-double");
+    const stub = env.ChatAgent.get(id);
+    await runInDurableObject<ChatAgent, void>(stub, async (agent) => {
+      // Pretend a client is connected. We override getConnections so the
+      // live-client check sees one; broadcast() falls through to the real
+      // WebSocket map (empty in tests) and silently no-ops.
+      const fake = { send: () => {} } as unknown as Connection;
+      const stubbed = agent as unknown as {
+        getConnections: () => Iterable<Connection>;
+      };
+      const original = stubbed.getConnections.bind(agent);
+      stubbed.getConnections = () => [fake];
+
+      try {
+        await agent.executeTask("delivered live", fakeSchedule("live-1"));
+      } finally {
+        stubbed.getConnections = original;
+      }
+
+      const rows = agent.sql<{ id: number }>`
+        SELECT id FROM pending_notifications
+      `;
+      expect(rows).toHaveLength(0);
     });
   });
 

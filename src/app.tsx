@@ -296,6 +296,11 @@ function Chat() {
       setMcpUrl("");
     } catch (e) {
       console.error("Failed to add MCP server:", e);
+      toasts.add({
+        title: "Couldn't add MCP server",
+        description: e instanceof Error ? e.message : String(e),
+        timeout: 8000
+      });
     } finally {
       setIsAddingServer(false);
     }
@@ -306,6 +311,11 @@ function Chat() {
       await agent.stub.removeServer(serverId);
     } catch (e) {
       console.error("Failed to remove MCP server:", e);
+      toasts.add({
+        title: "Couldn't remove MCP server",
+        description: e instanceof Error ? e.message : String(e),
+        timeout: 8000
+      });
     }
   };
 
@@ -408,7 +418,6 @@ function Chat() {
   const send = useCallback(async () => {
     const text = input.trim();
     if ((!text && attachments.length === 0) || isStreaming) return;
-    setInput("");
 
     const parts: Array<
       | { type: "text"; text: string }
@@ -418,10 +427,25 @@ function Chat() {
 
     // Read attachments in parallel — file reads are independent and
     // sequential awaits would make the send latency the sum of all
-    // file sizes.
-    const dataUris = await Promise.all(
-      attachments.map((att) => fileToDataUri(att.file))
-    );
+    // file sizes. Resolve before clearing the draft so a failure
+    // doesn't drop the user's typed text and attachments silently.
+    let dataUris: string[];
+    try {
+      dataUris = await Promise.all(
+        attachments.map((att) => fileToDataUri(att.file))
+      );
+    } catch (e) {
+      console.error("Failed to read attachment:", e);
+      toasts.add({
+        title: "Couldn't read attachment",
+        description:
+          "One of the files couldn't be read. Your message hasn't been sent.",
+        timeout: 6000
+      });
+      return; // Keep input + attachments so the user can retry.
+    }
+
+    setInput("");
     attachments.forEach((att, i) =>
       parts.push({ type: "file", mediaType: att.mediaType, url: dataUris[i] })
     );
@@ -431,7 +455,7 @@ function Chat() {
 
     sendMessage({ role: "user", parts });
     if (textareaRef.current) textareaRef.current.style.height = "auto";
-  }, [input, attachments, isStreaming, sendMessage]);
+  }, [input, attachments, isStreaming, sendMessage, toasts]);
 
   return (
     <div
@@ -540,6 +564,7 @@ function Chat() {
                         value={mcpName}
                         onChange={(e) => setMcpName(e.target.value)}
                         placeholder="Server name"
+                        aria-label="MCP server name"
                         className="w-full px-3 py-1.5 text-sm rounded-lg border border-kumo-line bg-kumo-base text-kumo-default placeholder:text-kumo-inactive focus:outline-none focus:ring-1 focus:ring-kumo-accent"
                       />
                       <div className="flex gap-2">
@@ -548,6 +573,7 @@ function Chat() {
                           value={mcpUrl}
                           onChange={(e) => setMcpUrl(e.target.value)}
                           placeholder="https://mcp.example.com"
+                          aria-label="MCP server URL"
                           className="flex-1 px-3 py-1.5 text-sm rounded-lg border border-kumo-line bg-kumo-base text-kumo-default placeholder:text-kumo-inactive focus:outline-none focus:ring-1 focus:ring-kumo-accent font-mono"
                         />
                         <Button

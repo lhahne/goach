@@ -1,5 +1,6 @@
 import {
   createRemoteJWKSet,
+  errors as joseErrors,
   jwtVerify,
   type JWTPayload,
   type JWTVerifyGetKey
@@ -95,7 +96,14 @@ export async function verifyAccessJwt(
     });
     return payload as AccessClaims;
   } catch (err) {
-    throw new AccessAuthError("Invalid Cloudflare Access JWT", err);
+    // Only treat real JWT/JWKS validation failures as auth errors. A
+    // network failure fetching the JWKS endpoint is an infrastructure
+    // problem, not the user's fault — let it propagate so the fetch
+    // handler can return 503 instead of a misleading 401.
+    if (err instanceof joseErrors.JOSEError) {
+      throw new AccessAuthError("Invalid Cloudflare Access JWT", err);
+    }
+    throw err;
   }
 }
 
