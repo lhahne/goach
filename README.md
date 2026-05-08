@@ -67,6 +67,12 @@ and by `vite build` rather than by unit tests.
 
 ## Deploy
 
+> **Before you deploy: set up auth.** The worker has no built-in user
+> authentication. Without [Cloudflare Access](#auth-cloudflare-access)
+> in front of it, the deployed URL is publicly reachable — anyone who
+> guesses or finds it can chat with your coach, see your habit data,
+> and write to your habit MCP. **Configure Access first**, then deploy.
+
 ```bash
 npm run deploy
 ```
@@ -93,8 +99,11 @@ the missed notifications — adequate for a single-user coach.
 
 ## Auth (Cloudflare Access)
 
-The deployed worker has no built-in user auth — anyone with the URL can
-chat with your coach. Put **Cloudflare Access** in front of it:
+**Required before deploy.** The worker ships with no built-in user
+authentication. The deployed URL is public by default, so without
+Cloudflare Access in front of it anyone who finds the URL can read
+your habit data and write to your MCP server. The steps below set up
+the auth gate and turn it on:
 
 1. **Dashboard:** Zero Trust → Access → Applications → Add an
    application → Self-hosted. Set the application domain to your
