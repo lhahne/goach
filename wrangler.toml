@@ -1,0 +1,20 @@
+name = "intervals-icu-mcp"
+main = "src/index.ts"
+compatibility_date = "2024-09-23"
+compatibility_flags = ["nodejs_compat"]
+
+# Non-secret configuration. Secrets (INTERVALS_API_KEY, optional MCP_AUTH_TOKEN)
+# are set with `wrangler secret put`.
+[vars]
+# Cloudflare Access settings for the /authorize route (see spec §5).
+ACCESS_TEAM_DOMAIN = "yourteam.cloudflareaccess.com"
+ACCESS_AUD = "replace-with-access-application-aud-tag"
+OWNER_EMAIL = "you@example.com"
+# DEV_ACCESS_EMAIL is intentionally NOT set here — it is for local dev/tests only
+# and must never be present in a deployed environment.
+
+# OAuth token/client store used by @cloudflare/workers-oauth-provider.
+# Create with: wrangler kv namespace create OAUTH_KV  (then paste the id below)
+[[kv_namespaces]]
+binding = "OAUTH_KV"
+id = "replace-with-kv-namespace-id"

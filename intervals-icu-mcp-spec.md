@@ -197,7 +197,7 @@ Activity **streams** (per-second power/HR/pace/GPS) and **full curves** can be t
   "zod": "^3.x"
 }
 ```
-Dev/test: `vitest`, `@cloudflare/vitest-pool-workers`, `msw` (or `undici` `MockAgent`), `wrangler`.
+Dev/test: `vitest`, `@vitest/coverage-v8`, `typescript`, `wrangler`, `@types/node`, `@cloudflare/workers-types`.
 
 ---
 
@@ -274,7 +274,7 @@ After deploy, add the URL (e.g. `https://intervals-mcp.yourname.workers.dev/mcp`
 ## 11. Security, Privacy & Safe Writes
 
 - Your Intervals.icu data only leaves the Worker when you explicitly call a tool.
-- Access to the MCP endpoint is gated by the OAuth 2.1 flow (§5); the upstream login (Cloudflare Access / single password) is what actually authenticates *you*. OAuth tokens are short-lived and refreshable, and live in KV — revoke by clearing the store.
+- Access to the MCP endpoint is gated by the OAuth 2.1 flow (§5); the upstream **Cloudflare Access** login (single-email policy) is what actually authenticates *you*. OAuth tokens are short-lived and refreshable, and live in KV — revoke by clearing the store.
 - **Safe writes:** MCP doesn't enforce confirmation itself — express intent through the protocol so clients can prompt:
   - Mark writes with annotations: `readOnlyHint: false`, `destructiveHint`, and `idempotentHint: true` for upserts like `update_wellness`.
   - For irreversible actions, prefer MCP **elicitation** to ask the user to confirm (requires the stateful `McpAgent` path).
@@ -288,13 +288,17 @@ After deploy, add the URL (e.g. `https://intervals-mcp.yourname.workers.dev/mcp`
 
 Extensive automated testing arranged as a pyramid: a broad base of fast unit tests, a smaller band of integration tests against the real Worker runtime, and a thin top of end-to-end contract tests driven by a real MCP client. **Every layer runs fully locally** — no calls to claude.ai, no calls to the real Intervals.icu API, no deployed Worker. All outbound HTTP to Intervals.icu is intercepted; the OAuth flow is exercised against the locally-running Worker.
 
-### Tooling
+### Tooling (as implemented)
 
-- **Vitest** as the runner for all layers.
-- **`@cloudflare/vitest-pool-workers`** runs tests **inside `workerd`** (the same runtime Cloudflare deploys), via Miniflare — so KV bindings, secrets, and the OAuth provider behave as in production, locally and offline.
-- **MSW** (or `undici` `MockAgent`) intercepts the Worker's outbound `fetch` to `intervals.icu`. Responses are **fixtures derived from the Intervals.icu OpenAPI spec** so shapes stay realistic.
-- **`@modelcontextprotocol/sdk` `Client`** drives the top of the pyramid over a real transport.
-- Deterministic clock/`Date` and seeded fixtures; no network, no wall-clock flakiness.
+- **Vitest** runs all layers in the Node environment. `npm test` is the single entry point; coverage thresholds are enforced (`@vitest/coverage-v8`).
+- The **real `@cloudflare/workers-oauth-provider`** and **real `@modelcontextprotocol/sdk`** are exercised — not mocked. Two small Vitest `resolve.alias` shims keep the suite in Node while matching the Workers runtime:
+  - `cloudflare:workers` → a no-op `WorkerEntrypoint` stub (the provider's only Workers-runtime import).
+  - `jose` → its **browser/`workerd` build** (the same fetch-based JWKS code that runs on Workers), so Access-JWT verification is tested on the real production path.
+- **Outbound `fetch` to Intervals.icu is dependency-injected** into the client (a `vi.fn`/stub returning OpenAPI-shaped fixtures) — no network, and backoff `sleep` is injected so retries are instant.
+- **OAuth state uses an in-memory `KVNamespace` fake**; the full OAuth flow (DCR → PKCE authorize → token → refresh) runs against the real provider.
+- The Worker still **bundles for `workerd`** and is validated with `wrangler deploy --dry-run` in CI for runtime fidelity.
+
+> Why Node + shims instead of `@cloudflare/vitest-pool-workers`? For a project this size it is faster, simpler, and dependency-light, while the aliases ensure the exact Workers code paths (OAuth provider, fetch-based jose) are still the ones under test. `vitest-pool-workers` remains a valid option if deeper Miniflare/binding fidelity is later required.
 
 ### Layer 1 — Unit tests (the broad base, the majority of tests)
 
@@ -304,26 +308,31 @@ Pure functions, no Worker runtime, milliseconds each:
 - **Intervals.icu client:** URL/auth construction (Basic Auth header, athlete `0` path), query-param building, and the **retry/backoff** logic — `429`/`5xx` retried, `Retry-After` honored, retries capped, `4xx` not retried — using a stubbed `fetch`.
 - **Summarization / downsampling:** the context-budget logic (§6) — streams downsampled to the target point count, curves reduced to the selected duration set, activity lists truncated to `limit`. Assert output size bounds.
 - **Tool handlers:** each handler with a **mocked client**, asserting it maps inputs → the right client call and shapes the summarized result. Include error mapping (client throw → MCP `isError` content).
-- **Auth helpers:** token/PKCE/PRM helper logic and the optional static-token middleware check.
+- **Auth:** the `DEV_ACCESS_EMAIL` dev override, missing/invalid Access header → `null`, owner vs non-owner gating, and **real Cloudflare Access JWT verification** — a `jose`-signed RS256 token validated against a stubbed JWKS, plus a wrong-audience rejection.
 
-### Layer 2 — Integration tests (middle band, against the real runtime)
+### Layer 2 — Integration tests (middle band)
 
-Run the assembled Worker in `workers-pool` (workerd + Miniflare), with Intervals.icu mocked via MSW and a **real KV** binding for OAuth state. Exercise the HTTP surface directly:
+`test/integration/` connects a **real MCP `Client`** to a **real `McpServer`** over the SDK's `InMemoryTransport`, backed by a real `IntervalsClient` with an injected fetch. Asserts the MCP protocol contract:
 
-- **OAuth discovery & flow:** `GET /.well-known/oauth-protected-resource` and `/.well-known/oauth-authorization-server` return correct metadata; **DCR** registers a client; the **authorization-code + PKCE (S256)** flow issues an access token; the **refresh** grant works; tokens persist in KV.
-- **Auth enforcement:** an MCP request with no/expired/invalid token gets `401` with a `WWW-Authenticate` header pointing at the PRM doc; a valid token passes.
-- **MCP protocol:** `initialize`, `tools/list` (all tools present with descriptions + annotations), and `tools/call` for representative read and write tools over the Streamable HTTP transport — asserting the outbound Intervals.icu request (method, path, Basic Auth, athlete `0`) and the summarized response.
-- **Write safety:** `update_wellness` is idempotent (same date upserts), and tool annotations (`readOnlyHint`/`destructiveHint`/`idempotentHint`) are present.
-- **Error propagation:** simulated Intervals.icu `429`/`500` surfaces as a clean MCP error, not a crash.
+- `tools/list`: all tools present with descriptions and annotations (`readOnlyHint`, etc.).
+- `tools/call` for a read tool returns the summarized Intervals.icu data as JSON text.
+- Input validation rejects a bad date (returned as an `isError` result).
+- A simulated Intervals.icu `404` surfaces as a clean MCP error (`isError: true`), not a crash.
 
-### Layer 3 — End-to-end contract tests (thin top)
+### Layer 3 — End-to-end / OAuth contract tests (thin top)
 
-A handful of tests that connect a **real MCP `Client`** (from `@modelcontextprotocol/sdk`) to the locally-running Worker and complete the full **OAuth handshake → `tools/list` → `tools/call`** journey, with Intervals.icu still mocked. This proves the server is genuinely usable by a spec-compliant client (the same contract Claude uses) without ever leaving the machine. Optionally scripted against `wrangler dev` for a manual smoke run, and the **MCP Inspector** is documented for ad-hoc local debugging.
+`test/worker/` invokes the **real exported Worker** (`OAuthProvider` + handlers) via `worker.fetch(...)` with an in-memory KV and `DEV_ACCESS_EMAIL` standing in for the Cloudflare Access identity, with Intervals.icu stubbed. It walks the **entire** journey end to end, locally:
+
+- `GET /.well-known/oauth-authorization-server` returns correct metadata.
+- An unauthenticated `POST /mcp` gets `401` + `WWW-Authenticate`.
+- **DCR** (`/register`) → **PKCE S256 authorize** (`/authorize`) → **token exchange** (`/token`) yields access + refresh tokens.
+- The Bearer token then drives `initialize` → `tools/list` → `tools/call get_wellness` over the protected, stateless Streamable HTTP endpoint, returning the stubbed data.
+- A non-owner identity is refused at `/authorize` with `403`.
 
 ### Coverage, CI & gates
 
-- Coverage thresholds enforced (e.g. lines/branches ≥ 90% on `src/`), checked by Vitest.
-- A single `npm test` runs all three layers locally and in CI; a `test:watch` script for development.
+- Coverage thresholds enforced by Vitest (lines/functions/statements ≥ 90%, branches ≥ 85% on `src/`); current suite ≈ 98% lines.
+- A single `npm test` runs every layer; `npm run typecheck` (`tsc --noEmit`) and `wrangler deploy --dry-run` guard types and the Workers bundle.
 - **CI runs the identical local suite** (GitHub Actions: `npm ci && npm test`) — no secrets, no deploy, no external network required, so the pipeline is hermetic and reproducible.
 
 ### Operability (kept from before)
