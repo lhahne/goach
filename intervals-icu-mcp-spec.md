@@ -37,7 +37,7 @@ The server runs on **Cloudflare Workers** (edge, cheap, fast cold starts, native
 
 ## 3. Non-Goals (MVP)
 
-- No multi-user or team support (OAuth is single-user — backed by Cloudflare Access or one password; not a full IdP)
+- No multi-user or team support (OAuth is single-user — backed by Cloudflare Access with a single-email policy; not a full IdP)
 - No custom identity provider — reuse Cloudflare's `workers-oauth-provider` rather than building OAuth from scratch
 - Not every single Intervals.icu endpoint (focus on the 8–10 highest-value tools first)
 - No heavy frontend (optional minimal status page is acceptable)
@@ -91,12 +91,18 @@ Two distinct layers: how **Claude (and other MCP clients) authenticate to the Wo
 
 **Implementation: use Cloudflare's `@cloudflare/workers-oauth-provider`.** It implements the OAuth 2.1 server, DCR, PKCE, PRM/AS metadata discovery, and token issuance/refresh for you, and wraps the MCP handler so only authenticated requests reach your tools. The library is the authorization **server**; you only supply the login/consent step.
 
-Because this is a **single-user personal** server, keep that login trivial — don't stand up a full IdP:
+**Decided: Cloudflare Access (Zero Trust) is the upstream login.** Flow:
 
-- **Recommended: Cloudflare Access (Zero Trust) as the upstream login,** gated to your email. `workers-oauth-provider` speaks OAuth to Claude; Cloudflare Access provides the actual human authentication (SSO/one-time PIN to your email). No passwords to manage, and the OAuth surface Claude needs is fully satisfied.
-- **Alternative: a single-password consent screen** backed by a `LOGIN_PASSWORD` secret, if you'd rather not use Access.
+1. Claude hits the OAuth `/authorize` endpoint (served by our `defaultHandler`).
+2. That route sits behind a **Cloudflare Access self-hosted application**, gated by a policy that allows only your email. Access performs the human authentication (SSO / one-time PIN) and injects a signed identity (`Cf-Access-Jwt-Assertion` + `Cf-Access-Authenticated-User-Email`).
+3. The Worker **verifies the Access JWT** (against `https://<team>.cloudflareaccess.com/cdn-cgi/access/certs`, checking the `aud` of the Access app) and confirms the email equals the configured owner. Single user ⇒ **no consent screen needed**; it auto-approves and calls `OAUTH_PROVIDER.completeAuthorization(...)`.
+4. `workers-oauth-provider` issues the code/token back to Claude.
 
-Store OAuth state (issued tokens, registered clients) in a **KV namespace** — this is the one place KV *is* needed once you add OAuth (the `workers-oauth-provider` uses it as its token/client store).
+So Access authenticates *you*; `workers-oauth-provider` gives *Claude* the OAuth 2.1 surface it requires. No passwords to manage.
+
+Config needed (non-secret `vars` in `wrangler.toml`): `ACCESS_TEAM_DOMAIN` (e.g. `yourteam.cloudflareaccess.com`), `ACCESS_AUD` (the Access application AUD tag), `OWNER_EMAIL` (allowed identity). For **local dev/test** where Access isn't present, the Access-identity lookup is pluggable and reads `DEV_ACCESS_EMAIL` instead of verifying a JWT (never enabled in production).
+
+Store OAuth state (issued tokens, registered clients) in a **KV namespace** — `workers-oauth-provider` uses it as its token/client store.
 
 ### 5.2 Other clients (Claude Code CLI, Cursor, scripts)
 
@@ -122,8 +128,11 @@ Keep both paths only if you want the CLI shortcut; OAuth alone is sufficient and
 |---|---|---|
 | `INTERVALS_API_KEY` | secret | Basic Auth to Intervals.icu |
 | `OAUTH_KV` | KV namespace | `workers-oauth-provider` token/client store |
-| `LOGIN_PASSWORD` | secret | only if using the single-password consent screen instead of Cloudflare Access |
+| `ACCESS_TEAM_DOMAIN` | var | Cloudflare Access team domain for JWT verification |
+| `ACCESS_AUD` | var | Cloudflare Access application AUD tag |
+| `OWNER_EMAIL` | var | the single allowed identity |
 | `MCP_AUTH_TOKEN` | secret | optional static token for header-capable clients (e.g. Claude Code CLI) |
+| `DEV_ACCESS_EMAIL` | var (dev/test only) | simulates the Access identity locally |
 
 ---
 
@@ -198,7 +207,7 @@ Dev/test: `vitest`, `@cloudflare/vitest-pool-workers`, `msw` (or `undici` `MockA
 intervals-icu-mcp/
 ├── src/
 │   ├── index.ts                 # Entry: workers-oauth-provider wrapping the Hono app + MCP handler
-│   ├── auth.ts                  # OAuth login/consent (Cloudflare Access or single password)
+│   ├── auth.ts                  # /authorize handler: verify Cloudflare Access JWT, auto-approve owner
 │   ├── mcp-server.ts            # Tool registration & descriptions
 │   ├── tools/
 │   │   ├── wellness.ts
@@ -246,16 +255,19 @@ wrangler secret put INTERVALS_API_KEY
 wrangler kv namespace create OAUTH_KV
 # → copy the printed id into the OAUTH_KV binding in wrangler.toml
 
-# One of: Cloudflare Access in front of the login route, OR a single password
-wrangler secret put LOGIN_PASSWORD            # only if not using Cloudflare Access
-
 # Optional: static token for header-capable clients (e.g. Claude Code CLI)
 wrangler secret put MCP_AUTH_TOKEN            # optional
 
+# Set non-secret vars in wrangler.toml: ACCESS_TEAM_DOMAIN, ACCESS_AUD, OWNER_EMAIL
 wrangler deploy
 ```
 
-After deploy, add the URL (e.g. `https://intervals-mcp.yourname.workers.dev/mcp`) as a **custom connector** in claude.ai / Claude Desktop; Claude will run the OAuth flow automatically.
+**Cloudflare Access setup (one time, in the Zero Trust dashboard):**
+1. Create a **self-hosted Access application** covering the authorize route (e.g. `intervals-mcp.<you>.workers.dev/authorize`).
+2. Add a policy: **Allow**, selector **Emails** = your email.
+3. Copy the application **AUD** tag → set `ACCESS_AUD`; set `ACCESS_TEAM_DOMAIN` to `<you>.cloudflareaccess.com`.
+
+After deploy, add the URL (e.g. `https://intervals-mcp.yourname.workers.dev/mcp`) as a **custom connector** in claude.ai / Claude Desktop; Claude runs the OAuth flow, Access prompts you to log in, and you're connected.
 
 ---
 
@@ -339,8 +351,7 @@ A handful of tests that connect a **real MCP `Client`** (from `@modelcontextprot
 - ~~How many tools in v0.1?~~ **Decided:** the 7 High-Priority tools (§6); add Medium tier in v0.2.
 - ~~KV-only vs D1 early?~~ **Decided:** one KV namespace from the start (required as the OAuth token/client store, §5); D1 and any caching KV deferred to Phase 2.
 - Should we auto-generate tool schemas from the Intervals.icu OpenAPI spec? **Recommended where it reduces drift**, but hand-write the LLM-facing `description` text either way.
-- ~~Which auth for Claude?~~ **Decided:** OAuth 2.1 via `@cloudflare/workers-oauth-provider`, login backed by Cloudflare Access (or a single password). Static bearer token kept only as an optional convenience for header-capable clients like Claude Code CLI (§5).
-- Cloudflare Access vs single-password for the OAuth upstream login? (Access = no passwords, recommended; password = zero extra Cloudflare setup.)
+- ~~Which auth for Claude?~~ **Decided:** OAuth 2.1 via `@cloudflare/workers-oauth-provider`, with **Cloudflare Access** as the upstream login (single-email policy; the `/authorize` route verifies the Access JWT). Static bearer token kept only as an optional convenience for header-capable clients like Claude Code CLI (§5).
 
 ---
 
