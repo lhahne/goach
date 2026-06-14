@@ -2,7 +2,7 @@
 
 **Single-user bridge between Claude / Grok and the Intervals.icu API**
 **Platform:** Cloudflare Workers (TypeScript)
-**Version:** 0.2
+**Version:** 0.3
 **Date:** June 2026
 
 ---
@@ -37,8 +37,8 @@ The server runs on **Cloudflare Workers** (edge, cheap, fast cold starts, native
 
 ## 3. Non-Goals (MVP)
 
-- No multi-user or team support
-- No complex OAuth flows (a static bearer token or Cloudflare Access is sufficient)
+- No multi-user or team support (OAuth is single-user — backed by Cloudflare Access or one password; not a full IdP)
+- No custom identity provider — reuse Cloudflare's `workers-oauth-provider` rather than building OAuth from scratch
 - Not every single Intervals.icu endpoint (focus on the 8–10 highest-value tools first)
 - No heavy frontend (optional minimal status page is acceptable)
 
@@ -65,7 +65,8 @@ For a **single-user, read-heavy** server where every tool is a clean request →
 - **`@modelcontextprotocol/sdk`** (`McpServer`) for tool registration
 - Cloudflare's MCP adapter (`createMcpHandler` for stateless; `agents`/`McpAgent` if you opt into stateful)
 - Small, typed **Intervals.icu client** (wrapper around `fetch` + Zod schemas, with retry + rate-limit handling)
-- **Worker secrets only** for the MVP (no KV needed — see §5)
+- **`@cloudflare/workers-oauth-provider`** wrapping the MCP handler so Claude's required OAuth 2.1 flow is satisfied (see §5)
+- **Secrets** for the Intervals.icu key + **one KV namespace** as the OAuth token/client store
 
 **Why MCP?**
 It is the established 2025–2026 standard. Claude Desktop/claude.ai, Cursor, Windsurf, Goose, and many other agents support it natively. Add the server once and it works across many tools.
@@ -74,26 +75,55 @@ It is the established 2025–2026 standard. Claude Desktop/claude.ai, Cursor, Wi
 
 ---
 
-## 5. Authentication (Simple Personal Flow)
+## 5. Authentication
 
-Two lightweight layers.
+Two distinct layers: how **Claude (and other MCP clients) authenticate to the Worker**, and how the **Worker authenticates to Intervals.icu**.
 
-### 1. Worker protection (MCP endpoint)
+### 5.1 Client → Worker: OAuth 2.1 (required for Claude)
 
-- Use a strong random `MCP_AUTH_TOKEN` (generate once) and check it in Hono middleware as `Authorization: Bearer <token>`.
-- **Client caveat:** a static bearer token is **not** accepted by every MCP client. claude.ai / Claude Desktop "custom connectors" expect an OAuth flow for remote servers; clients that allow arbitrary headers (or the `mcp-remote` bridge) can pass the static token directly. Pick one of:
-  - **Cloudflare Access (Zero Trust)** in front of the Worker, gated to your email — gives you SSO with no token to manage, and works well with `mcp-remote`. **Recommended.**
-  - Static bearer token for clients that support custom headers, plus `mcp-remote` for those that don't.
-  - Full OAuth via Cloudflare's `workers-oauth-provider` only if a client requires it.
+**Claude's hosted clients — claude.ai (web) and Claude Desktop "custom connectors" — do not accept a static bearer token. They require an OAuth 2.1 authorization-code flow.** To "ensure auth works at Claude", the Worker must implement OAuth, not a shared secret. Concretely, Claude expects:
 
-### 2. Intervals.icu
+- **OAuth 2.1 + PKCE** with the `S256` challenge method, exact redirect-URI matching, no implicit grant.
+- **Protected Resource Metadata (PRM)** at `/.well-known/oauth-protected-resource`, and **Authorization Server Metadata** at `/.well-known/oauth-authorization-server`, so Claude can discover the endpoints.
+- A `401` on unauthenticated MCP requests carrying a `WWW-Authenticate` header that points at the PRM document.
+- **Client registration:** support **Dynamic Client Registration (DCR)** (Claude registers itself automatically). Claude's callback is `https://claude.ai/api/mcp/auth_callback` and its client name is `Claude`. (Client ID Metadata Documents / Anthropic-held credentials are alternatives, but DCR is the simplest to support.)
+- **Token expiry + refresh** (issue short-lived access tokens + refresh tokens).
+
+**Implementation: use Cloudflare's `@cloudflare/workers-oauth-provider`.** It implements the OAuth 2.1 server, DCR, PKCE, PRM/AS metadata discovery, and token issuance/refresh for you, and wraps the MCP handler so only authenticated requests reach your tools. The library is the authorization **server**; you only supply the login/consent step.
+
+Because this is a **single-user personal** server, keep that login trivial — don't stand up a full IdP:
+
+- **Recommended: Cloudflare Access (Zero Trust) as the upstream login,** gated to your email. `workers-oauth-provider` speaks OAuth to Claude; Cloudflare Access provides the actual human authentication (SSO/one-time PIN to your email). No passwords to manage, and the OAuth surface Claude needs is fully satisfied.
+- **Alternative: a single-password consent screen** backed by a `LOGIN_PASSWORD` secret, if you'd rather not use Access.
+
+Store OAuth state (issued tokens, registered clients) in a **KV namespace** — this is the one place KV *is* needed once you add OAuth (the `workers-oauth-provider` uses it as its token/client store).
+
+### 5.2 Other clients (Claude Code CLI, Cursor, scripts)
+
+The same OAuth flow works for any spec-compliant client. For convenience, clients that support custom headers can **also** be allowed in via a static `MCP_AUTH_TOKEN` checked in middleware — notably **Claude Code CLI**:
+
+```bash
+claude mcp add --transport http intervals https://intervals-mcp.<you>.workers.dev/mcp \
+  --header "Authorization: Bearer $MCP_AUTH_TOKEN"
+```
+
+Keep both paths only if you want the CLI shortcut; OAuth alone is sufficient and is the path Claude's connectors use.
+
+### 5.3 Worker → Intervals.icu
 
 - Store **your** Intervals.icu API key as a Worker secret (`INTERVALS_API_KEY`). Generate it under **Settings → Developer Settings**.
 - The Worker authenticates to Intervals.icu using **HTTP Basic Auth** with username `API_KEY` and password = your key:
   `Authorization: Basic base64("API_KEY:<your-key>")`.
 - **Athlete ID:** use `0` in the path (e.g. `/api/v1/athlete/0/...`) — Intervals.icu auto-resolves `0` to the athlete that owns the API key. No need to store your real `iNNNNNN` id.
 
-This setup requires only **2 secrets and one deploy** — no KV namespace for the MVP.
+### Secrets & bindings summary
+
+| Name | Type | Purpose |
+|---|---|---|
+| `INTERVALS_API_KEY` | secret | Basic Auth to Intervals.icu |
+| `OAUTH_KV` | KV namespace | `workers-oauth-provider` token/client store |
+| `LOGIN_PASSWORD` | secret | only if using the single-password consent screen instead of Cloudflare Access |
+| `MCP_AUTH_TOKEN` | secret | optional static token for header-capable clients (e.g. Claude Code CLI) |
 
 ---
 
@@ -143,7 +173,8 @@ Activity **streams** (per-second power/HR/pace/GPS) and **full curves** can be t
 - **Web framework**: Hono + `@modelcontextprotocol/sdk`, served via Cloudflare's stateless MCP handler (`McpAgent`/`agents` only if you opt into stateful)
 - **Validation & schemas**: Zod (also used to generate clean tool schemas)
 - **HTTP client**: native `fetch` with a typed wrapper (timeout, retry on 429/5xx with backoff, honoring `Retry-After`)
-- **Config & storage**: `wrangler.toml` + secrets (KV/D1 deferred to Phase 2)
+- **Auth**: `@cloudflare/workers-oauth-provider` (OAuth 2.1 server: DCR, PKCE, PRM/AS metadata, token refresh) — required for Claude connectors (§5)
+- **Config & storage**: `wrangler.toml` + secrets + one KV namespace for OAuth state (D1 / caching KV deferred to Phase 2)
 - **Observability**: Cloudflare Workers Logs / Logpush (+ optional Sentry)
 - **Types**: derived from the Intervals.icu OpenAPI spec where practical
 
@@ -151,11 +182,13 @@ Activity **streams** (per-second power/HR/pace/GPS) and **full curves** can be t
 ```json
 {
   "@modelcontextprotocol/sdk": "^1.x",
+  "@cloudflare/workers-oauth-provider": "^0.x",
   "agents": "^0.x",
   "hono": "^4.x",
   "zod": "^3.x"
 }
 ```
+Dev/test: `vitest`, `@cloudflare/vitest-pool-workers`, `msw` (or `undici` `MockAgent`), `wrangler`.
 
 ---
 
@@ -164,7 +197,8 @@ Activity **streams** (per-second power/HR/pace/GPS) and **full curves** can be t
 ```
 intervals-icu-mcp/
 ├── src/
-│   ├── index.ts                 # Entry point: Hono app + auth middleware + MCP handler
+│   ├── index.ts                 # Entry: workers-oauth-provider wrapping the Hono app + MCP handler
+│   ├── auth.ts                  # OAuth login/consent (Cloudflare Access or single password)
 │   ├── mcp-server.ts            # Tool registration & descriptions
 │   ├── tools/
 │   │   ├── wellness.ts
@@ -174,9 +208,15 @@ intervals-icu-mcp/
 │   │   └── workouts.ts
 │   ├── lib/
 │   │   ├── intervals-client.ts  # Typed Intervals.icu fetch wrapper (auth, retry, rate limit)
+│   │   ├── summarize.ts         # Stream/curve downsampling + list truncation (context budget)
 │   │   └── schemas.ts           # Zod schemas + LLM-friendly descriptions
 │   └── config.ts
-├── test/                        # Vitest unit tests (schemas, client, tool handlers)
+├── test/
+│   ├── unit/                    # Layer 1: schemas, client, summarize, tool handlers, auth helpers
+│   ├── integration/            # Layer 2: Worker in workerd — OAuth flow, auth enforcement, MCP protocol
+│   ├── e2e/                     # Layer 3: real MCP Client → local Worker (full OAuth → tools/call)
+│   └── fixtures/               # Intervals.icu responses derived from the OpenAPI spec
+├── vitest.config.ts             # @cloudflare/vitest-pool-workers config
 ├── wrangler.toml
 ├── package.json
 └── README.md
@@ -186,10 +226,10 @@ intervals-icu-mcp/
 
 ## 9. Data Flow Example
 
-1. You add the MCP server URL + auth (bearer token or Cloudflare Access) in Claude / Cursor.
-2. LLM decides it needs data → calls a tool (e.g. `list_activities`).
+1. You add the MCP server URL in Claude → Claude discovers `/.well-known/oauth-protected-resource`, runs the OAuth 2.1 + PKCE flow (DCR + your Cloudflare Access / password login), and stores an access + refresh token.
+2. LLM decides it needs data → calls a tool (e.g. `list_activities`) with the OAuth access token.
 3. Worker receives an MCP `tools/call` request over Streamable HTTP.
-4. Hono middleware validates the bearer token (or Cloudflare Access has already gated the request).
+4. `workers-oauth-provider` validates the access token (401 + `WWW-Authenticate` → PRM if missing/expired); the request reaches the tool handler.
 5. Worker calls Intervals.icu using your stored API key (Basic Auth, athlete `0`).
 6. Worker validates and **summarizes** the result, returns structured JSON to the LLM.
 7. LLM reasons over the data and responds naturally to you.
@@ -199,24 +239,30 @@ intervals-icu-mcp/
 ## 10. Deployment
 
 ```bash
-# Set secrets
+# Intervals.icu key
 wrangler secret put INTERVALS_API_KEY
-wrangler secret put MCP_AUTH_TOKEN
 
-# Deploy (no KV namespace needed for the MVP)
+# OAuth state store (modern syntax — the old `kv:namespace` colon form is deprecated)
+wrangler kv namespace create OAUTH_KV
+# → copy the printed id into the OAUTH_KV binding in wrangler.toml
+
+# One of: Cloudflare Access in front of the login route, OR a single password
+wrangler secret put LOGIN_PASSWORD            # only if not using Cloudflare Access
+
+# Optional: static token for header-capable clients (e.g. Claude Code CLI)
+wrangler secret put MCP_AUTH_TOKEN            # optional
+
 wrangler deploy
 ```
 
-After deploy, add the URL (e.g. `https://intervals-mcp.yourname.workers.dev/mcp`) to your MCP client, with the bearer token or behind Cloudflare Access.
-
-> If you later add KV (Phase 2 caching), the modern command is `wrangler kv namespace create INTERVALS_MCP` (note: the older `wrangler kv:namespace create` colon syntax is deprecated), then add the binding to `wrangler.toml`.
+After deploy, add the URL (e.g. `https://intervals-mcp.yourname.workers.dev/mcp`) as a **custom connector** in claude.ai / Claude Desktop; Claude will run the OAuth flow automatically.
 
 ---
 
 ## 11. Security, Privacy & Safe Writes
 
 - Your Intervals.icu data only leaves the Worker when you explicitly call a tool.
-- Keep the Worker URL + token private, or protect with Cloudflare Access.
+- Access to the MCP endpoint is gated by the OAuth 2.1 flow (§5); the upstream login (Cloudflare Access / single password) is what actually authenticates *you*. OAuth tokens are short-lived and refreshable, and live in KV — revoke by clearing the store.
 - **Safe writes:** MCP doesn't enforce confirmation itself — express intent through the protocol so clients can prompt:
   - Mark writes with annotations: `readOnlyHint: false`, `destructiveHint`, and `idempotentHint: true` for upserts like `update_wellness`.
   - For irreversible actions, prefer MCP **elicitation** to ask the user to confirm (requires the stateful `McpAgent` path).
@@ -226,12 +272,53 @@ After deploy, add the URL (e.g. `https://intervals-mcp.yourname.workers.dev/mcp`
 
 ---
 
-## 12. Testing & Operability (new)
+## 12. Testing Strategy (Testing Pyramid — 100% Local)
 
-- **Unit tests (Vitest)** for Zod schemas, the Intervals.icu client (mock `fetch`), and each tool handler's summarization logic.
-- **Local dev** with `wrangler dev`; smoke-test the MCP endpoint with the MCP Inspector.
-- **Error handling:** tool failures should return MCP error content (`isError: true`) with a useful message, never an unhandled throw.
-- **Logging:** log tool name + duration + status (never the API key or raw personal data).
+Extensive automated testing arranged as a pyramid: a broad base of fast unit tests, a smaller band of integration tests against the real Worker runtime, and a thin top of end-to-end contract tests driven by a real MCP client. **Every layer runs fully locally** — no calls to claude.ai, no calls to the real Intervals.icu API, no deployed Worker. All outbound HTTP to Intervals.icu is intercepted; the OAuth flow is exercised against the locally-running Worker.
+
+### Tooling
+
+- **Vitest** as the runner for all layers.
+- **`@cloudflare/vitest-pool-workers`** runs tests **inside `workerd`** (the same runtime Cloudflare deploys), via Miniflare — so KV bindings, secrets, and the OAuth provider behave as in production, locally and offline.
+- **MSW** (or `undici` `MockAgent`) intercepts the Worker's outbound `fetch` to `intervals.icu`. Responses are **fixtures derived from the Intervals.icu OpenAPI spec** so shapes stay realistic.
+- **`@modelcontextprotocol/sdk` `Client`** drives the top of the pyramid over a real transport.
+- Deterministic clock/`Date` and seeded fixtures; no network, no wall-clock flakiness.
+
+### Layer 1 — Unit tests (the broad base, the majority of tests)
+
+Pure functions, no Worker runtime, milliseconds each:
+
+- **Schemas:** every Zod input/output schema — valid cases, boundary cases, and rejected bad input (e.g. malformed dates, negative limits, out-of-range power).
+- **Intervals.icu client:** URL/auth construction (Basic Auth header, athlete `0` path), query-param building, and the **retry/backoff** logic — `429`/`5xx` retried, `Retry-After` honored, retries capped, `4xx` not retried — using a stubbed `fetch`.
+- **Summarization / downsampling:** the context-budget logic (§6) — streams downsampled to the target point count, curves reduced to the selected duration set, activity lists truncated to `limit`. Assert output size bounds.
+- **Tool handlers:** each handler with a **mocked client**, asserting it maps inputs → the right client call and shapes the summarized result. Include error mapping (client throw → MCP `isError` content).
+- **Auth helpers:** token/PKCE/PRM helper logic and the optional static-token middleware check.
+
+### Layer 2 — Integration tests (middle band, against the real runtime)
+
+Run the assembled Worker in `workers-pool` (workerd + Miniflare), with Intervals.icu mocked via MSW and a **real KV** binding for OAuth state. Exercise the HTTP surface directly:
+
+- **OAuth discovery & flow:** `GET /.well-known/oauth-protected-resource` and `/.well-known/oauth-authorization-server` return correct metadata; **DCR** registers a client; the **authorization-code + PKCE (S256)** flow issues an access token; the **refresh** grant works; tokens persist in KV.
+- **Auth enforcement:** an MCP request with no/expired/invalid token gets `401` with a `WWW-Authenticate` header pointing at the PRM doc; a valid token passes.
+- **MCP protocol:** `initialize`, `tools/list` (all tools present with descriptions + annotations), and `tools/call` for representative read and write tools over the Streamable HTTP transport — asserting the outbound Intervals.icu request (method, path, Basic Auth, athlete `0`) and the summarized response.
+- **Write safety:** `update_wellness` is idempotent (same date upserts), and tool annotations (`readOnlyHint`/`destructiveHint`/`idempotentHint`) are present.
+- **Error propagation:** simulated Intervals.icu `429`/`500` surfaces as a clean MCP error, not a crash.
+
+### Layer 3 — End-to-end contract tests (thin top)
+
+A handful of tests that connect a **real MCP `Client`** (from `@modelcontextprotocol/sdk`) to the locally-running Worker and complete the full **OAuth handshake → `tools/list` → `tools/call`** journey, with Intervals.icu still mocked. This proves the server is genuinely usable by a spec-compliant client (the same contract Claude uses) without ever leaving the machine. Optionally scripted against `wrangler dev` for a manual smoke run, and the **MCP Inspector** is documented for ad-hoc local debugging.
+
+### Coverage, CI & gates
+
+- Coverage thresholds enforced (e.g. lines/branches ≥ 90% on `src/`), checked by Vitest.
+- A single `npm test` runs all three layers locally and in CI; a `test:watch` script for development.
+- **CI runs the identical local suite** (GitHub Actions: `npm ci && npm test`) — no secrets, no deploy, no external network required, so the pipeline is hermetic and reproducible.
+
+### Operability (kept from before)
+
+- **Error handling:** tool failures return MCP error content (`isError: true`) with a useful message, never an unhandled throw.
+- **Logging:** log tool name + duration + status (never the API key, tokens, or raw personal data).
+- **Local dev:** `wrangler dev` + MCP Inspector for manual exploration.
 
 ---
 
@@ -250,9 +337,10 @@ After deploy, add the URL (e.g. `https://intervals-mcp.yourname.workers.dev/mcp`
 
 - ~~Full `McpAgent` + Agents SDK, or lighter stateless implementation?~~ **Decided:** start stateless (`createMcpHandler()`), upgrade to `McpAgent` only if elicitation/session state is needed (§4).
 - ~~How many tools in v0.1?~~ **Decided:** the 7 High-Priority tools (§6); add Medium tier in v0.2.
-- ~~KV-only vs D1 early?~~ **Decided:** secrets-only for MVP; defer both to Phase 2 caching (§5, §7).
+- ~~KV-only vs D1 early?~~ **Decided:** one KV namespace from the start (required as the OAuth token/client store, §5); D1 and any caching KV deferred to Phase 2.
 - Should we auto-generate tool schemas from the Intervals.icu OpenAPI spec? **Recommended where it reduces drift**, but hand-write the LLM-facing `description` text either way.
-- Which MCP clients must be supported on day one (determines bearer-token vs Cloudflare Access vs OAuth — §5)?
+- ~~Which auth for Claude?~~ **Decided:** OAuth 2.1 via `@cloudflare/workers-oauth-provider`, login backed by Cloudflare Access (or a single password). Static bearer token kept only as an optional convenience for header-capable clients like Claude Code CLI (§5).
+- Cloudflare Access vs single-password for the OAuth upstream login? (Access = no passwords, recommended; password = zero extra Cloudflare setup.)
 
 ---
 
