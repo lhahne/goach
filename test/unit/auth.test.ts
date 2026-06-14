@@ -75,4 +75,40 @@ describe("handleAuthorize", () => {
       }),
     );
   });
+
+  function envWithScopes(requested: string[], completeAuthorization = vi.fn()) {
+    const parseAuthRequest = vi.fn(async () => ({
+      responseType: "code",
+      clientId: "c1",
+      redirectUri: "https://claude.ai/api/mcp/auth_callback",
+      scope: requested,
+      state: "xyz",
+    }));
+    return {
+      env: makeEnv({
+        OAUTH_PROVIDER: { parseAuthRequest, completeAuthorization } as never,
+      }),
+      completeAuthorization,
+    };
+  }
+
+  it("rejects with 400 when no requested scope is supported", async () => {
+    const { env, completeAuthorization } = envWithScopes(["admin:all"]);
+    const verify = vi.fn(async () => "owner@example.com");
+    const res = await handleAuthorize(authorizeRequest(), env, verify);
+    expect(res.status).toBe(400);
+    expect(completeAuthorization).not.toHaveBeenCalled();
+  });
+
+  it("grants only the supported subset of requested scopes", async () => {
+    const { env, completeAuthorization } = envWithScopes(
+      ["intervals:read", "admin:all"],
+      vi.fn(async () => ({ redirectTo: "https://claude.ai/api/mcp/auth_callback?code=abc" })),
+    );
+    const verify = vi.fn(async () => "owner@example.com");
+    await handleAuthorize(authorizeRequest(), env, verify);
+    expect(completeAuthorization).toHaveBeenCalledWith(
+      expect.objectContaining({ scope: ["intervals:read"] }),
+    );
+  });
 });

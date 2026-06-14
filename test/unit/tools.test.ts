@@ -92,6 +92,20 @@ describe("get_activity", () => {
     })) as { streams: Record<string, unknown[]> };
     expect(result.streams.watts).toHaveLength(100);
   });
+
+  it("returns empty streams (no throw) when the API returns null", async () => {
+    const client = fakeClient({
+      getActivity: vi.fn(async () => ({ id: "i1" })),
+      getActivityStreams: vi.fn(async () => null),
+    });
+    const result = (await tool("get_activity").handler(client, {
+      id: "i1",
+      include_streams: true,
+      stream_types: ["watts"],
+      max_stream_points: 100,
+    })) as { streams: Record<string, unknown[]> };
+    expect(result.streams).toEqual({});
+  });
 });
 
 describe("curves", () => {
@@ -137,6 +151,19 @@ describe("curves (alternate payload shapes)", () => {
       newest: "2026-06-01",
     })) as { points: unknown[] };
     expect(result.points).toEqual([]);
+  });
+
+  it("drops non-numeric values and clamps mismatched parallel arrays", async () => {
+    const client = fakeClient({
+      getCurves: vi.fn(async () => ({ secs: [1, 5, 60], values: [500, null] })),
+    });
+    const result = (await tool("get_power_curves").handler(client, {
+      oldest: "2026-01-01",
+      newest: "2026-06-01",
+      durations: [1, 5, 60],
+    })) as { points: { secs: number; value: number }[] };
+    // values clamped to length 2; the null value at index 1 is dropped.
+    expect(result.points).toEqual([{ secs: 1, value: 500 }]);
   });
 });
 

@@ -9,8 +9,10 @@ const SERVER_INFO = {
 } as const;
 
 function jsonResult(value: unknown): CallToolResult {
+  // Compact JSON — tool outputs can be large, and indentation wastes the
+  // model's context budget for no benefit to the LLM.
   return {
-    content: [{ type: "text", text: JSON.stringify(value, null, 2) }],
+    content: [{ type: "text", text: JSON.stringify(value) }],
   };
 }
 

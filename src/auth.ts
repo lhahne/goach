@@ -76,7 +76,23 @@ export async function handleAuthorize(
   }
 
   const authReq = await env.OAUTH_PROVIDER.parseAuthRequest(request);
-  const scope = authReq.scope.length > 0 ? authReq.scope : [...OAUTH_SCOPES];
+
+  // Only ever grant scopes this server supports. If the client requested
+  // scopes, grant the intersection; reject if none are allowed. With no
+  // requested scopes, grant the full supported set.
+  const supported = new Set<string>(OAUTH_SCOPES);
+  let scope: string[];
+  if (authReq.scope.length > 0) {
+    scope = authReq.scope.filter((s) => supported.has(s));
+    if (scope.length === 0) {
+      return new Response("invalid_scope: no supported scopes requested.", {
+        status: 400,
+      });
+    }
+  } else {
+    scope = [...OAUTH_SCOPES];
+  }
+
   const { redirectTo } = await env.OAUTH_PROVIDER.completeAuthorization({
     request: authReq,
     userId: email!,

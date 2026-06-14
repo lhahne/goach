@@ -56,6 +56,8 @@ describe("MCP server integration", () => {
     const text = (res.content as { type: string; text: string }[])[0].text;
     expect(res.isError).toBeFalsy();
     expect(JSON.parse(text)[0]).toMatchObject({ weight: 91.5, ctl: 70 });
+    // Compact JSON — no pretty-print indentation in tool output.
+    expect(text).not.toContain("\n  ");
   });
 
   it("validates input and rejects a bad date", async () => {

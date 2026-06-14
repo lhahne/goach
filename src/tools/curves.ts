@@ -6,20 +6,32 @@ import {
 } from "../lib/summarize.js";
 import { READ_ONLY, type ToolDef } from "./types.js";
 
+/** Only keep points whose secs and value are both finite numbers. */
+function isValidPoint(p: { secs: unknown; value: unknown }): p is CurvePoint {
+  return Number.isFinite(p.secs as number) && Number.isFinite(p.value as number);
+}
+
 /** Normalise the various curve payload shapes into [{secs,value}]. */
 function toCurvePoints(raw: unknown): CurvePoint[] {
+  // Array-of-points shape, e.g. [{ secs, value|watts }].
+  if (Array.isArray(raw)) {
+    return raw
+      .map((p) => ({ secs: (p as any)?.secs, value: (p as any)?.value ?? (p as any)?.watts }))
+      .filter(isValidPoint);
+  }
   if (!raw || typeof raw !== "object") return [];
   const obj = raw as Record<string, unknown>;
-  // Intervals.icu typically returns parallel arrays: secs[] + the metric[].
-  const secs = (obj.secs ?? obj.secsList) as number[] | undefined;
-  const values = (obj.values ?? obj.watts ?? obj.list) as number[] | undefined;
+  // Parallel-arrays shape: secs[] + the metric[]. Clamp to the shared length.
+  const secs = (obj.secs ?? obj.secsList) as unknown[] | undefined;
+  const values = (obj.values ?? obj.watts ?? obj.list) as unknown[] | undefined;
   if (Array.isArray(secs) && Array.isArray(values)) {
-    return secs.map((s, i) => ({ secs: s, value: values[i] }));
-  }
-  if (Array.isArray(raw)) {
-    return (raw as Record<string, number>[])
-      .filter((p) => typeof p.secs === "number")
-      .map((p) => ({ secs: p.secs, value: (p.value ?? p.watts) as number }));
+    const n = Math.min(secs.length, values.length);
+    const points: CurvePoint[] = [];
+    for (let i = 0; i < n; i++) {
+      const point = { secs: secs[i], value: values[i] };
+      if (isValidPoint(point)) points.push(point);
+    }
+    return points;
   }
   return [];
 }

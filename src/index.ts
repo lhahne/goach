@@ -20,9 +20,12 @@ const mcpApiHandler = {
       enableJsonResponse: true,
     });
     await server.connect(transport);
-    const response = await transport.handleRequest(request);
-    ctx.waitUntil(server.close());
-    return response;
+    try {
+      return await transport.handleRequest(request);
+    } finally {
+      // Always tear down the per-request server, even if handling threw.
+      ctx.waitUntil(server.close());
+    }
   },
 };
 

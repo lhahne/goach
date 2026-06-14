@@ -71,17 +71,13 @@ export class IntervalsClient {
     return Math.min(2 ** attempt * 500, 8000);
   }
 
-  private async request<T>(
-    method: string,
-    path: string,
-    opts: { query?: Query; body?: unknown } = {},
-  ): Promise<T> {
-    const url = this.buildUrl(path, opts.query);
+  /** Core request: retry/backoff loop + safe JSON parsing for any URL. */
+  private async send<T>(method: string, url: string, body?: unknown): Promise<T> {
     const headers: Record<string, string> = {
       Authorization: this.authHeader(),
       Accept: "application/json",
     };
-    if (opts.body !== undefined) headers["Content-Type"] = "application/json";
+    if (body !== undefined) headers["Content-Type"] = "application/json";
 
     let lastError: unknown;
     for (let attempt = 0; attempt <= this.maxRetries; attempt++) {
@@ -90,7 +86,7 @@ export class IntervalsClient {
         res = await this.fetchImpl(url, {
           method,
           headers,
-          body: opts.body !== undefined ? JSON.stringify(opts.body) : undefined,
+          body: body !== undefined ? JSON.stringify(body) : undefined,
         });
       } catch (err) {
         // Network error — retry with backoff.
@@ -105,7 +101,15 @@ export class IntervalsClient {
       if (res.ok) {
         if (res.status === 204) return undefined as T;
         const text = await res.text();
-        return (text ? JSON.parse(text) : undefined) as T;
+        if (!text) return undefined as T;
+        try {
+          return JSON.parse(text) as T;
+        } catch {
+          throw new IntervalsApiError(
+            res.status,
+            `Invalid JSON response: ${text.slice(0, 200)}`,
+          );
+        }
       }
 
       const retryable = res.status === 429 || res.status >= 500;
@@ -117,6 +121,15 @@ export class IntervalsClient {
     }
     // Unreachable in practice, but satisfies the type checker.
     throw lastError ?? new Error("Intervals.icu request failed");
+  }
+
+  /** Athlete-scoped request (/api/v1/athlete/0/...). */
+  private request<T>(
+    method: string,
+    path: string,
+    opts: { query?: Query; body?: unknown } = {},
+  ): Promise<T> {
+    return this.send<T>(method, this.buildUrl(path, opts.query), opts.body);
   }
 
   // --- Read endpoints ---
@@ -171,24 +184,14 @@ export class IntervalsClient {
     return this.request("PUT", `/wellness/${date}`, { body: fields });
   }
 
-  /** Helper for the few non athlete-scoped endpoints. */
-  private async requestAbsolute<T>(
-    method: string,
-    path: string,
-    query?: Query,
-  ): Promise<T> {
+  /** Helper for the few non athlete-scoped endpoints (shares retry/backoff). */
+  private requestAbsolute<T>(method: string, path: string, query?: Query): Promise<T> {
     const url = new URL(`${this.baseUrl}${path}`);
     if (query) {
       for (const [k, v] of Object.entries(query)) {
         if (v !== undefined) url.searchParams.set(k, String(v));
       }
     }
-    const res = await this.fetchImpl(url.toString(), {
-      method,
-      headers: { Authorization: this.authHeader(), Accept: "application/json" },
-    });
-    if (!res.ok) throw new IntervalsApiError(res.status, await res.text());
-    const text = await res.text();
-    return (text ? JSON.parse(text) : undefined) as T;
+    return this.send<T>(method, url.toString());
   }
 }

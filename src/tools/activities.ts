@@ -54,7 +54,7 @@ export const activityTools: ToolDef[] = [
             channels[s.type] = downsample(s.data, maxPoints);
           }
         }
-      } else {
+      } else if (raw && typeof raw === "object") {
         for (const [k, v] of Object.entries(raw)) {
           if (Array.isArray(v)) channels[k] = downsample(v, maxPoints);
         }

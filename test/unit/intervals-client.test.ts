@@ -135,6 +135,26 @@ describe("read endpoints build the right URLs", () => {
     fetchImpl.mockResolvedValueOnce(new Response("missing", { status: 404 }));
     await expect(client.getActivity("nope")).rejects.toBeInstanceOf(IntervalsApiError);
   });
+
+  it("throws IntervalsApiError on a 200 with a non-JSON body", async () => {
+    const { fetchImpl, client } = setup();
+    fetchImpl.mockResolvedValueOnce(
+      new Response("<html>maintenance</html>", {
+        status: 200,
+        headers: { "Content-Type": "text/html" },
+      }),
+    );
+    await expect(client.getAthlete()).rejects.toBeInstanceOf(IntervalsApiError);
+  });
+
+  it("retries absolute (getActivity) requests on 5xx", async () => {
+    const { fetchImpl, client } = setup();
+    fetchImpl
+      .mockResolvedValueOnce(new Response("boom", { status: 500 }))
+      .mockResolvedValueOnce(jsonResponse({ id: "i1" }));
+    await expect(client.getActivity("i1")).resolves.toEqual({ id: "i1" });
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+  });
 });
 
 describe("writes", () => {
